@@ -587,14 +587,23 @@ pub fn apply(env: &SetupEnv, plan: &Plan) -> Result<Vec<String>> {
                     )));
                 }
                 if let Some(before) = &edit.before {
-                    fs::create_dir_all(&backups)?;
-                    fs::write(backups.join(edit.backup_name), before)?;
+                    backup_config(&backups, edit.backup_name, before.as_bytes())?;
                 }
                 write_atomic(&edit.path, &edit.after)?;
                 report.push(format!("{}: {}", slash(&edit.path), edit.describe));
             }
             Step::ClaudeMcp { cli, config } => {
-                run_claude_mcp(cli, config.as_ref())?;
+                // Claude rewrites this file itself. Capture the latest bytes
+                // immediately before its first mutating command, not at plan time.
+                let before = read_optional(&env.home.join(".claude.json"))?;
+                let backup = before
+                    .as_ref()
+                    .map(|contents| backup_config(&backups, "claude.json", contents.as_bytes()))
+                    .transpose()?;
+                run_claude_mcp(cli, config.as_ref()).map_err(|error| match &backup {
+                    Some(path) => Error::Invalid(format!("{error}. Previous Claude config saved to {}.", slash(path))),
+                    None => error,
+                })?;
                 report.push(match config {
                     Some(_) => "Registered the csm MCP server with Claude Code (user scope).".into(),
                     None => "Removed the csm MCP server from Claude Code.".into(),
@@ -841,6 +850,32 @@ fn render_json(root: &Map<String, Value>, before: Option<&str>) -> String {
         text = text.replace('\n', "\r\n");
     }
     text
+}
+
+/// Keep every snapshot, even when two setup runs share a timestamp.
+fn backup_config(dir: &Path, name: &str, contents: &[u8]) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let (stem, extension) = name.rsplit_once('.').unwrap_or((name, ""));
+    let mut suffix = 0u64;
+    loop {
+        let filename = if suffix == 0 {
+            name.to_string()
+        } else if extension.is_empty() {
+            format!("{stem}-{suffix}")
+        } else {
+            format!("{stem}-{suffix}.{extension}")
+        };
+        let path = dir.join(filename);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(contents)?;
+                file.sync_all()?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => suffix += 1,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
@@ -1093,6 +1128,36 @@ mod tests {
             _ => None,
         });
         assert!(edit.unwrap().after.contains(&format!("hook codex --db {}", slash(&env.db))));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn claude_cli_backup_uses_latest_file_and_preserves_same_stamp_snapshots() {
+        let (mut env, root) = fake_env("claude-cli-backup");
+        env.claude_cli = Some(root.join("missing-claude-cli"));
+        let config = env.home.join(".claude.json");
+        fs::write(&config, "{\"numStartups\": 1}").unwrap();
+        let mut changes = plan(&env, &Options { only: vec![Agent::Claude], ..Default::default() }).unwrap();
+        changes.steps.retain(|step| matches!(step, Step::ClaudeMcp { .. }));
+        assert_eq!(changes.steps.len(), 1);
+
+        // Claude can rewrite its own config after setup has planned the change.
+        let latest = "{\r\n  \"numStartups\": 2, \"label\": \"caf\u{e9}\"\r\n}\r\n";
+        fs::write(&config, latest).unwrap();
+        let failed = apply(&env, &changes).unwrap_err().to_string();
+        let first = env.data_dir.join("backups").join(&env.stamp).join("claude.json");
+        assert_eq!(fs::read(&first).unwrap(), latest.as_bytes());
+        assert!(failed.contains(&slash(&first)), "{failed}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), latest);
+
+        // The timestamp has second precision; another run must not replace it.
+        let newer = "{\"numStartups\": 3}";
+        fs::write(&config, newer).unwrap();
+        let failed_again = apply(&env, &changes).unwrap_err().to_string();
+        let second = first.with_file_name("claude-1.json");
+        assert_eq!(fs::read(&first).unwrap(), latest.as_bytes());
+        assert_eq!(fs::read(&second).unwrap(), newer.as_bytes());
+        assert!(failed_again.contains(&slash(&second)), "{failed_again}");
         fs::remove_dir_all(&root).unwrap();
     }
 
