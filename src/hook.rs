@@ -9,6 +9,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -72,6 +73,9 @@ pub fn main(args: &[String]) -> ExitCode {
         } else if host_name.is_empty() && !word.starts_with('-') {
             host_name = word.clone();
         }
+    }
+    if let Some(dir) = db.as_deref().filter(|p| p.is_absolute()).and_then(Path::parent) {
+        let _ = LOG_PATH.set(dir.join("hook-errors.log"));
     }
     let failure = match std::panic::catch_unwind(|| run(&host_name, db)) {
         Ok(Ok(Some(out))) => {
@@ -303,10 +307,21 @@ fn session_start_context(
     Ok(Some(out.to_string()))
 }
 
+/// Set when `--db` points somewhere else, so the log sits next to that
+/// database instead of in the default data directory.
+static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+fn log_path() -> Option<PathBuf> {
+    LOG_PATH.get().cloned().or_else(|| paths::hook_log_path().ok())
+}
+
 /// Appends one line (time, host, error class) to the hook log. Never
 /// includes payload content.
 fn log_failure(host: &str, message: &str) {
-    let Ok(path) = paths::hook_log_path() else {
+    if cfg!(test) {
+        return;
+    }
+    let Some(path) = log_path() else {
         return;
     };
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
@@ -321,7 +336,7 @@ fn log_failure(host: &str, message: &str) {
 
 /// The most recent hook failure, for `csm status`.
 pub fn last_failure() -> Option<String> {
-    let text = std::fs::read_to_string(paths::hook_log_path().ok()?).ok()?;
+    let text = std::fs::read_to_string(log_path()?).ok()?;
     text.lines().last().map(str::to_string)
 }
 

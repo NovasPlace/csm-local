@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod paths;
 pub mod project;
 pub mod redact;
+pub mod setup;
 pub mod store;
 mod text;
 mod time;

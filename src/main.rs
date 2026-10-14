@@ -6,7 +6,7 @@ use csm_local::brief::{self, BriefRequest};
 use csm_local::journal::{Checkpoint, EventQuery, EVENT_KINDS, MAX_HANDOFF_BYTES};
 use csm_local::mcp::Server;
 use csm_local::store::{Filter, NewMemory, Store};
-use csm_local::{hook, paths, project, Error, Result};
+use csm_local::{hook, paths, project, setup, Error, Result};
 
 #[derive(Parser)]
 #[command(name = "csm", version, about = "Local-first, private cross-session memory for coding agents")]
@@ -147,6 +147,24 @@ enum Command {
         /// claude or codex
         host: String,
     },
+    /// Install csm and connect it to Claude Code and Codex (user scope)
+    Setup {
+        /// Show what would change without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply without asking
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Remove csm's hooks and MCP registration (keeps the binary and your data)
+        #[arg(long)]
+        uninstall: bool,
+        /// Show what is installed right now
+        #[arg(long)]
+        status: bool,
+        /// Only these agents, comma-separated: claude, codex
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -253,6 +271,21 @@ fn run(cli: Cli) -> Result<()> {
         }
         hook::main(&args);
         return Ok(());
+    }
+    if let Command::Setup { dry_run, yes, uninstall, status, only } = &cli.command {
+        if *status {
+            setup::status(cli.db.clone())?.iter().for_each(|line| println!("{line}"));
+            return Ok(());
+        }
+        let only = only
+            .iter()
+            .map(|name| {
+                setup::Agent::parse(name)
+                    .ok_or_else(|| Error::Invalid(format!("unknown agent {name:?}; use claude or codex")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let options = setup::Options { dry_run: *dry_run, yes: *yes, uninstall: *uninstall, only };
+        return setup::run(options, cli.db.clone());
     }
     let db = match cli.db {
         Some(db) => db,
@@ -434,7 +467,7 @@ fn run(cli: Cli) -> Result<()> {
             let project = resolve_project(project)?;
             Server::new(store, project).run_stdio()?;
         }
-        Command::Hook { .. } => unreachable!("handled before opening the store"),
+        Command::Hook { .. } | Command::Setup { .. } => unreachable!("handled before opening the store"),
     }
     Ok(())
 }

@@ -38,7 +38,7 @@ pub fn hook_log_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("hook-errors.log"))
 }
 
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     let var = |name: &str| env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
     if cfg!(windows) {
         var("USERPROFILE").or_else(|| var("HOME"))
