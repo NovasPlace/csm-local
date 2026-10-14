@@ -95,6 +95,8 @@ pub struct SessionInfo {
 pub struct EventQuery<'a> {
     pub project: Option<&'a str>,
     pub session_id: Option<&'a str>,
+    /// Briefing-only exclusion; raw journal/export queries keep every event.
+    pub exclude_suggestion_sessions: bool,
     pub kinds: &'a [&'a str],
     /// Leave out events from these sessions (events without one are kept).
     pub exclude_sessions: &'a [&'a str],
@@ -121,6 +123,28 @@ pub struct CheckpointResult {
     pub checkpoint_id: i64,
     pub goal_id: Option<i64>,
     pub closed_goal: Option<String>,
+}
+
+// Recognize the exact Codex app preamble in recorded root prompts. Every
+// root prompt must have it, so a human continuation preserves the session.
+// Match project + host + session, and remove the whole session (including
+// child events) before query limits. Historical journal rows stay intact.
+const EXCLUDE_SUGGESTION_SESSIONS: &str = "
+    AND NOT EXISTS (
+        SELECT 1 FROM events AS prompt
+        WHERE events.host = 'codex' AND prompt.host = events.host
+          AND prompt.project = events.project AND prompt.session_id = events.session_id
+          AND prompt.kind = 'prompt' AND prompt.agent_id = ''
+        GROUP BY prompt.session_id
+        HAVING MIN(instr(prompt.summary, 'This is an app-generated request for a suggested next user message. The user did not write this message.') = 1) = 1
+    )";
+
+fn suggestion_filter(exclude: bool) -> &'static str {
+    if exclude {
+        EXCLUDE_SUGGESTION_SESSIONS
+    } else {
+        ""
+    }
 }
 
 const EVENT_COLUMNS: &str = "id, project, host, session_id, agent_id, kind, tool, summary, files, ok, detail, ts";
@@ -202,6 +226,7 @@ impl Store {
     pub fn events(&self, q: &EventQuery) -> Result<Vec<Event>> {
         let json =
             |items: &[&str]| (!items.is_empty()).then(|| serde_json::to_string(items).expect("strings serialize"));
+        let suggestion_filter = suggestion_filter(q.exclude_suggestion_sessions);
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {EVENT_COLUMNS} FROM events
              WHERE (?1 IS NULL OR project = ?1)
@@ -210,6 +235,7 @@ impl Store {
                AND (?4 IS NULL OR session_id IS NULL OR session_id NOT IN (SELECT value FROM json_each(?4)))
                AND (?5 IS NULL OR ts >= ?5)
                AND (?6 IS NULL OR id < ?6)
+               {suggestion_filter}
              ORDER BY id DESC
              LIMIT ?7"
         ))?;
@@ -261,16 +287,37 @@ impl Store {
 
     /// Up to `limit` sessions in `project`, most recently active first.
     pub fn recent_sessions(&self, project: &str, exclude: Option<&str>, limit: usize) -> Result<Vec<SessionInfo>> {
-        let mut stmt = self.conn.prepare(
+        self.query_recent_sessions(project, exclude, limit, false)
+    }
+
+    pub(crate) fn recent_briefing_sessions(
+        &self,
+        project: &str,
+        exclude: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionInfo>> {
+        self.query_recent_sessions(project, exclude, limit, true)
+    }
+
+    fn query_recent_sessions(
+        &self,
+        project: &str,
+        exclude: Option<&str>,
+        limit: usize,
+        exclude_suggestions: bool,
+    ) -> Result<Vec<SessionInfo>> {
+        let suggestion_filter = suggestion_filter(exclude_suggestions);
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT host, session_id, MIN(ts), MAX(ts), SUM(kind = 'prompt')
              FROM events
              WHERE project = ?1 AND session_id IS NOT NULL
                AND (?2 IS NULL OR session_id <> ?2)
                AND kind NOT IN ('session_start', 'compact', 'session_end')
+               {suggestion_filter}
              GROUP BY host, session_id
              ORDER BY MAX(ts) DESC, MAX(id) DESC
              LIMIT ?3",
-        )?;
+        ))?;
         let rows = stmt.query_map(params![project, exclude, limit as i64], |r| {
             Ok(SessionInfo {
                 host: r.get(0)?,

@@ -92,8 +92,20 @@ pub fn build(store: &Store, req: &BriefRequest) -> Result<Option<Briefing>> {
     Ok(Some(render(req, sections, budget)))
 }
 
+fn latest_briefing_event(store: &Store, req: &BriefRequest, kinds: &[&str]) -> Result<Option<Event>> {
+    Ok(store
+        .events(&EventQuery {
+            project: Some(req.project),
+            kinds,
+            exclude_suggestion_sessions: true,
+            limit: 1,
+            ..Default::default()
+        })?
+        .pop())
+}
+
 fn goal(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
-    let Some(g) = store.active_goal(req.project)? else {
+    let Some(g) = latest_briefing_event(store, req, &["goal", "goal_done"])?.filter(|e| e.kind == "goal") else {
         return Ok(None);
     };
     Ok(Some(Section {
@@ -109,7 +121,7 @@ fn goal(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
 }
 
 fn checkpoint(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
-    let Some(c) = store.latest_event(req.project, &["checkpoint"])? else {
+    let Some(c) = latest_briefing_event(store, req, &["checkpoint"])? else {
         return Ok(None);
     };
     if req.now - c.ts > CHECKPOINT_MAX_AGE_MS {
@@ -135,6 +147,7 @@ fn problem(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
     let runs = store.events(&EventQuery {
         project: Some(req.project),
         kinds: &["command", "test"],
+        exclude_suggestion_sessions: true,
         since_ts: Some(req.now - PROBLEM_MAX_AGE_MS),
         limit: 200,
         ..Default::default()
@@ -206,7 +219,7 @@ struct Sessions {
 }
 
 fn previous_session(store: &Store, req: &BriefRequest) -> Result<Sessions> {
-    let candidates = store.recent_sessions(req.project, req.current_session, 8)?;
+    let candidates = store.recent_briefing_sessions(req.project, req.current_session, 8)?;
     let skip_live = req.exclude_active && req.current_session.is_none();
     let is_live = |s: &SessionInfo| skip_live && !s.ended && req.now - s.last_ts <= ACTIVE_WINDOW_MS;
     let mut shown = Vec::new();
@@ -266,6 +279,7 @@ fn session_events(store: &Store, req: &BriefRequest, session_id: &str) -> Result
     store.events(&EventQuery {
         project: Some(req.project),
         session_id: Some(session_id),
+        exclude_suggestion_sessions: true,
         limit: 500,
         ..Default::default()
     })
@@ -375,6 +389,7 @@ fn recent(store: &Store, req: &BriefRequest, shown: &[String]) -> Result<Option<
         project: Some(req.project),
         kinds: &["edit", "write", "delete"],
         exclude_sessions: &exclude,
+        exclude_suggestion_sessions: true,
         since_ts: Some(req.now - RECENT_MAX_AGE_MS),
         limit: 100,
         ..Default::default()
@@ -511,6 +526,111 @@ mod tests {
         let mut older = ev("edit", "claude", "older", "Edit README.md");
         older.files = vec!["README.md".into()];
         store.record_at(older, at(3000)).unwrap();
+    }
+
+    const SUGGESTION: &str =
+        "This is an app-generated request for a suggested next user message. The user did not write this message.";
+
+    #[test]
+    fn suggestion_sessions_cannot_crowd_out_work_or_leak_into_other_sections() {
+        let store = Store::open_in_memory().unwrap();
+        seed(&store);
+        store.record_at(ev("goal", "codex", "old", "Finish genuine work"), NOW - 250 * MIN).unwrap();
+        store.record_at(ev("checkpoint", "codex", "old", "Genuine checkpoint"), NOW - 249 * MIN).unwrap();
+        let mut hidden = Vec::new();
+        for i in 0..12 {
+            let session = format!("suggestion-{i}");
+            for (kind, summary) in [
+                ("prompt", SUGGESTION),
+                ("turn_end", "suggestion-noise reply"),
+                ("goal", "suggestion-noise goal"),
+                ("goal_done", "suggestion-noise done"),
+                ("checkpoint", "suggestion-noise checkpoint"),
+            ] {
+                hidden.push(store.record_at(ev(kind, "codex", &session, summary), NOW - MIN).unwrap().unwrap());
+            }
+        }
+        // More than each query's pre-filter limit; genuine older failures
+        // and file changes still need to survive.
+        for _ in 0..220 {
+            let mut fail = ev("test", "codex", "suggestion-11", "Run: suggestion-noise-test");
+            fail.ok = Some(false);
+            hidden.push(store.record_at(fail, NOW - MIN).unwrap().unwrap());
+            let mut edit = ev("edit", "codex", "suggestion-11", "Edit suggestion-noise.rs");
+            edit.agent_id = "background-child".into();
+            hidden.push(store.record_at(edit, NOW - MIN).unwrap().unwrap());
+        }
+        let before = store.events(&EventQuery { project: Some(P), limit: 1000, ..Default::default() }).unwrap();
+        for request in [req(Some("current")), BriefRequest { exclude_active: true, ..req(None) }] {
+            let b = build(&store, &request).unwrap().unwrap();
+            for expected in [
+                "Finish genuine work",
+                "Genuine checkpoint",
+                "add the parser tests",
+                "Last recorded failure",
+                "Edit README.md",
+            ] {
+                assert!(b.text.contains(expected), "missing {expected}: {}", b.text);
+            }
+            assert!(!b.text.contains("suggestion-noise"), "{}", b.text);
+            assert!(!b.text.contains("app-generated request"), "{}", b.text);
+            assert!(!b.text.contains("Sessions active in the last 30 minutes"), "{}", b.text);
+            assert!(b.sources.iter().all(|source| !hidden.iter().any(|id| source == &format!("event:{id}"))));
+        }
+        let after = store.events(&EventQuery { project: Some(P), limit: 1000, ..Default::default() }).unwrap();
+        assert_eq!(before.len(), after.len(), "briefing filters must not delete journal events");
+        assert!(after.iter().any(|e| e.summary == SUGGESTION));
+    }
+
+    #[test]
+    fn a_project_with_only_suggestion_sessions_has_no_briefing() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_at(ev("prompt", "codex", "suggestion", SUGGESTION), NOW - MIN).unwrap();
+        store.record_at(ev("turn_end", "codex", "suggestion", "suggestion-noise reply"), NOW).unwrap();
+        assert!(build(&store, &req(None)).unwrap().is_none());
+        assert!(build(&store, &BriefRequest { exclude_active: true, ..req(None) }).unwrap().is_none());
+    }
+
+    #[test]
+    fn suggestion_detection_does_not_hide_real_or_mixed_conversations() {
+        for (host, first, second, agent) in [
+            ("claude", SUGGESTION.to_owned(), None, ""),
+            ("codex", format!("Please explain: {SUGGESTION}"), None, ""),
+            ("codex", "suggest a next user message for my app".to_owned(), None, ""),
+            ("codex", "This is an app-generated request for a suggested next user message.".to_owned(), None, ""),
+            ("codex", "Implement the parser".to_owned(), Some(SUGGESTION), ""),
+            ("codex", SUGGESTION.to_owned(), Some("Now implement my actual change"), ""),
+            ("codex", SUGGESTION.to_owned(), None, "child"),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let mut prompt = ev("prompt", host, "real", &first);
+            prompt.agent_id = agent.into();
+            store.record_at(prompt, NOW - 3 * MIN).unwrap();
+            if let Some(second) = second {
+                store.record_at(ev("prompt", host, "real", second), NOW - 2 * MIN).unwrap();
+            }
+            store.record_at(ev("turn_end", host, "real", "Genuine reply remains"), NOW - MIN).unwrap();
+            let b = build(&store, &req(None)).unwrap().expect("real session must remain");
+            assert!(b.text.contains("Genuine reply remains"), "{host}/{agent}: {}", b.text);
+        }
+    }
+
+    #[test]
+    fn suggestion_identity_is_scoped_to_host_and_project() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_at(ev("prompt", "codex", "shared", SUGGESTION), NOW - 4 * MIN).unwrap();
+        store.record_at(ev("prompt", "claude", "shared", "Keep the real Claude work"), NOW - 3 * MIN).unwrap();
+        store.record_at(ev("turn_end", "claude", "shared", "Genuine Claude reply"), NOW - 2 * MIN).unwrap();
+        store.record_at(ev("turn_end", "codex", "shared", "suggestion-noise reply"), NOW - MIN).unwrap();
+        let b = build(&store, &req(None)).unwrap().unwrap();
+        assert!(b.text.contains("Genuine Claude reply"), "{}", b.text);
+        assert!(!b.text.contains("suggestion-noise"), "{}", b.text);
+        let mut other = ev("prompt", "codex", "elsewhere", SUGGESTION);
+        other.project = "C:/another/project".into();
+        store.record_at(other, NOW - 3 * MIN).unwrap();
+        store.record_at(ev("prompt", "codex", "elsewhere", "Keep this project's work"), NOW).unwrap();
+        let b = build(&store, &req(None)).unwrap().unwrap();
+        assert!(b.text.contains("Keep this project's work"), "{}", b.text);
     }
 
     #[test]
