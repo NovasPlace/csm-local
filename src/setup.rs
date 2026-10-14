@@ -74,8 +74,9 @@ const CODEX_HOOKS: &[HookSpec] = &[
 
 const MCP_NAME: &str = "csm";
 
-static CSM_HOOK_COMMAND: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)(?:^|[\\/\s])csm(?:\.exe)?\s+hook\s+(?:claude|codex)\b").unwrap());
+static CSM_HOOK_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)^\s*(?:&\s+)?(?:"(?:[^"\r\n]*[\\/])?csm(?:\.exe)?"|'(?:[^'\r\n]*[\\/])?csm(?:\.exe)?'|(?:[^\s"'&;|<>]*[\\/])?csm(?:\.exe)?)\s+hook\s+(?:claude|codex)(?:\s+--db\s+(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s"'&;|<>]+))?\s*$"#).unwrap()
+});
 
 /// Where things are, resolved once. Fields are public so tests can point
 /// setup at a fake home directory.
@@ -132,7 +133,14 @@ impl SetupEnv {
     fn hook_command(&self, agent: Agent) -> String {
         let mut words = vec![slash(&self.bin()), "hook".into(), agent.host().into()];
         words.extend(self.db_args());
-        words.join(" ")
+        let powershell = cfg!(windows) && agent == Agent::Codex;
+        let call_operator = powershell && words[0].contains(' ');
+        let command = words.iter().map(|word| quote_hook_word(word, powershell)).collect::<Vec<_>>().join(" ");
+        if call_operator {
+            format!("& {command}")
+        } else {
+            command
+        }
     }
 
     fn mcp_args(&self) -> Vec<String> {
@@ -810,16 +818,25 @@ fn needs_copy(exe: &Path, bin: &Path) -> Result<bool> {
     Ok(fs::read(exe)? != fs::read(bin)?)
 }
 
-/// Hosts run hook commands through PowerShell, cmd or bash. An unquoted
-/// absolute path with forward slashes works in all three only if it has
-/// no spaces or characters those shells treat specially.
+/// Space-containing paths are quoted for the host shell. Other characters
+/// with expansion or quoting semantics remain unsupported across cmd/bash/PowerShell.
 fn check_command_word(word: &str) -> Result<()> {
-    if let Some(c) = word.chars().find(|c| c.is_whitespace() || "'\"`$%&;|()<>^!".contains(*c)) {
+    if let Some(c) =
+        word.chars().find(|c| c.is_control() || (c.is_whitespace() && *c != ' ') || "'\"`$%&;|()<>^!".contains(*c))
+    {
         return Err(Error::Invalid(format!(
-            "{word} contains {c:?}, which breaks hook commands in some shells; set CSM_HOME to a simple path such as C:/csm and run setup again"
+            "{word} contains {c:?}, which is not supported in hook command paths; choose a path without shell metacharacters or control characters (spaces are supported)"
         )));
     }
     Ok(())
+}
+
+fn quote_hook_word(word: &str, powershell: bool) -> String {
+    if !word.contains(' ') {
+        return word.to_string();
+    }
+    let quote = if powershell { '\'' } else { '"' };
+    format!("{quote}{word}{quote}")
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>> {
@@ -989,11 +1006,28 @@ mod tests {
     #[test]
     fn recognizes_csm_commands_only() {
         let handler = |c: &str| json!({ "type": "command", "command": c });
-        for c in ["C:/x/.csm/bin/csm.exe hook claude", "csm hook codex", "/home/me/.csm/bin/csm hook claude --db /x.db"]
-        {
+        for c in [
+            "C:/x/.csm/bin/csm.exe hook claude",
+            "csm hook codex",
+            "/home/me/.csm/bin/csm hook claude --db /x.db",
+            r#""C:/Users/José Smith/.csm/bin/csm.exe" hook claude --db "C:/memory data/csm.db""#,
+            "& 'C:/Users/José Smith/.csm/bin/csm.exe' hook codex --db 'C:/memory data/csm.db'",
+            "C:/simple/csm.exe hook codex --db 'C:/memory data/csm.db'",
+        ] {
             assert!(is_csm_handler(&handler(c)), "{c}");
         }
-        for c in ["python csm_hook.py", "mycsm hook claude", "csm-helper hook claude", "notify.exe"] {
+        for c in [
+            "python csm_hook.py",
+            "mycsm hook claude",
+            "csm-helper hook claude",
+            "notify.exe",
+            "echo C:/x/csm.exe hook claude",
+            r#"echo "C:/Users/José Smith/csm.exe" hook claude"#,
+            "python C:/x/csm.exe hook codex",
+            "csm hook claude && notify.exe",
+            "& 'C:/Users/José Smith/csm.exe' hook codex; notify.exe",
+            "'C:/Users/José Smith/csm.exe hook codex",
+        ] {
             assert!(!is_csm_handler(&handler(c)), "{c}");
         }
     }
@@ -1037,10 +1071,51 @@ mod tests {
 
     #[test]
     fn command_paths_must_survive_every_shell() {
-        assert!(check_command_word("C:/Users/Donovan/.csm/bin/csm.exe").is_ok());
-        for bad in ["C:/Users/John Smith/.csm/bin/csm.exe", "C:/a$b/csm.exe", "C:/50%/csm.exe", "C:/a&b/csm.exe"] {
+        for good in ["C:/Users/Donovan/.csm/bin/csm.exe", "C:/Users/José Smith 日本語/.csm/bin/csm.exe"] {
+            assert!(check_command_word(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "C:/a$b/csm.exe",
+            "C:/50%/csm.exe",
+            "C:/a&b/csm.exe",
+            "C:/a'b/csm.exe",
+            "C:/a\"b/csm.exe",
+            "C:/a!b/csm.exe",
+            "C:/a`b/csm.exe",
+            "C:/a\nb/csm.exe",
+            "C:/a\tb/csm.exe",
+        ] {
             assert!(check_command_word(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn hook_commands_preserve_simple_paths_and_quote_only_when_needed() {
+        let mut env = SetupEnv {
+            home: PathBuf::from("C:/Users/example"),
+            data_dir: PathBuf::from("C:/Users/example/.csm"),
+            db: PathBuf::from("C:/Users/example/.csm/csm.db"),
+            exe: PathBuf::new(),
+            claude_cli: None,
+            stamp: "unused".into(),
+        };
+        for agent in Agent::ALL {
+            assert_eq!(env.hook_command(agent), format!("{} hook {}", slash(&env.bin()), agent.host()));
+        }
+        env.db = PathBuf::from("C:/memory data/csm.db");
+        assert_eq!(
+            env.hook_command(Agent::Claude),
+            format!("{} hook claude --db \"C:/memory data/csm.db\"", slash(&env.bin()))
+        );
+        env.data_dir = PathBuf::from("C:/Users/José Smith/.csm");
+        let codex = env.hook_command(Agent::Codex);
+        let expected = if cfg!(windows) {
+            format!("& '{}' hook codex --db 'C:/memory data/csm.db'", slash(&env.bin()))
+        } else {
+            format!("\"{}\" hook codex --db \"C:/memory data/csm.db\"", slash(&env.bin()))
+        };
+        assert_eq!(codex, expected);
+        assert!(is_csm_handler(&json!({ "command": codex })));
     }
 
     fn fake_env(name: &str) -> (SetupEnv, PathBuf) {

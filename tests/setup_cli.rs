@@ -59,15 +59,18 @@ fn text(out: &Output) -> String {
 
 /// Runs a hook command line through a shell, as the host would.
 fn run_in_shell(fake: &FakeHome, shell: &[&str], command_line: &str, payload: Value) -> Output {
-    let mut child = fake
-        .command(Path::new(shell[0]))
-        .args(&shell[1..])
-        .arg(command_line)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut command = fake.command(Path::new(shell[0]));
+    #[cfg(windows)]
+    if shell[0].eq_ignore_ascii_case("cmd.exe") {
+        use std::os::windows::process::CommandExt;
+        // cmd parses a command string, not C argv: `.arg` would insert literal backslash-quotes.
+        command.args(["/D", "/S"]).args(&shell[1..]).raw_arg(format!("\"{command_line}\""));
+    } else {
+        command.args(&shell[1..]).arg(command_line);
+    }
+    #[cfg(not(windows))]
+    command.args(&shell[1..]).arg(command_line);
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     child.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
     child.wait_with_output().unwrap()
 }
@@ -155,4 +158,86 @@ fn installed_hook_commands_work_through_powershell_and_cmd() {
     let context = reply["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
     assert!(context.contains("Last request: \"wire up the installer — ünïcødé ok\""), "{context}");
     assert!(context.contains("Last reply: \"Installer done.\""), "{context}");
+}
+
+#[cfg(windows)]
+#[test]
+fn installed_hooks_support_space_and_unicode_paths() {
+    let powershell = ["powershell.exe", "-NoProfile", "-Command"];
+    let git_bash = std::env::var_os("ProgramFiles").map(PathBuf::from).map(|p| p.join("Git/bin/bash.exe"));
+    for custom_db in [false, true] {
+        let fake = FakeHome::new(if custom_db { "custom spáces 日本語" } else { "default spáces 日本語" });
+        let db = fake.root.join("memory data ü").join("session memory.db");
+        let db_arg = db.to_str().unwrap();
+        let run_setup = |flags: &[&str]| {
+            let mut args = if custom_db { vec!["--db", db_arg, "setup"] } else { vec!["setup"] };
+            args.extend_from_slice(flags);
+            fake.csm(&args)
+        };
+        let unrelated = json!({ "hooks": [{ "type": "command", "command": "echo unrelated" }] });
+        let settings = json!({ "theme": "dark", "hooks": { "Stop": [unrelated.clone()] } });
+        let hooks = json!({ "hooks": { "Stop": [unrelated] } });
+        fs::write(fake.home().join(".claude/settings.json"), settings.to_string()).unwrap();
+        fs::write(fake.home().join(".codex/hooks.json"), hooks.to_string()).unwrap();
+        let installed = run_setup(&["--yes"]);
+        assert!(installed.status.success(), "{}", text(&installed));
+
+        let codex_hooks = fake.read_json(".codex/hooks.json");
+        let claude_hooks = fake.read_json(".claude/settings.json");
+        let command =
+            |root: &Value, event: &str| root["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+        let codex_command = command(&codex_hooks, "SessionStart");
+        let claude_command = command(&claude_hooks, "UserPromptSubmit");
+        let cwd = fake.root.join("repo").display().to_string();
+        let prompt = "Remember the real work — 日本語 and ü survive spaced paths";
+        let out = run_in_shell(
+            &fake,
+            &powershell,
+            &codex_command,
+            json!({ "hook_event_name": "UserPromptSubmit", "session_id": "work", "cwd": cwd, "prompt": prompt }),
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{}", text(&out));
+
+        let mut shells = vec![vec!["cmd.exe".to_string(), "/C".to_string()]];
+        if let Some(bash) = git_bash.as_ref().filter(|p| p.is_file()) {
+            shells.push(vec![bash.to_str().unwrap().to_string(), "--noprofile".into(), "--norc".into(), "-c".into()]);
+        }
+        for (index, shell) in shells.iter().enumerate() {
+            let reply = format!("Spaced-path reply from shell {index}");
+            let shell: Vec<&str> = shell.iter().map(String::as_str).collect();
+            let out = run_in_shell(
+                &fake,
+                &shell,
+                &claude_command,
+                json!({ "hook_event_name": "Stop", "session_id": "work", "cwd": cwd,
+                    "last_assistant_message": reply, "stop_hook_active": false, "turn_id": format!("t{index}") }),
+            );
+            assert_eq!(out.status.code(), Some(0), "{shell:?}: {}", text(&out));
+            assert!(out.stderr.is_empty(), "{shell:?}: {}", text(&out));
+            let out = run_in_shell(
+                &fake,
+                &powershell,
+                &codex_command,
+                json!({ "hook_event_name": "SessionStart", "session_id": format!("reader-{index}"), "cwd": cwd, "source": "startup" }),
+            );
+            let result: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", text(&out)));
+            let context = result["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+            assert!(context.contains(prompt) && context.contains(&reply), "{shell:?}: {context}");
+        }
+        if custom_db {
+            assert!(db.is_file());
+            assert!(!fake.home().join(".csm/csm.db").exists(), "hook ignored the custom database");
+        }
+        let again = run_setup(&["--yes"]);
+        assert!(again.status.success() && text(&again).contains("Nothing to change."), "{}", text(&again));
+        assert_eq!(fake.read_json(".codex/hooks.json"), codex_hooks);
+        assert_eq!(fake.read_json(".claude/settings.json"), claude_hooks);
+        let status = text(&run_setup(&["--status"]));
+        assert!(status.contains("hooks 6/6 installed") && status.contains("hooks 5/5 installed"), "{status}");
+        let removed = run_setup(&["--uninstall", "--yes"]);
+        assert!(removed.status.success(), "{}", text(&removed));
+        assert_eq!(fake.read_json(".claude/settings.json"), settings);
+        assert_eq!(fake.read_json(".codex/hooks.json"), hooks);
+    }
 }
