@@ -1,0 +1,22 @@
+[package]
+name = "csm-local"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first, private cross-session memory for coding agents"
+license = "MIT"
+
+[[bin]]
+name = "csm"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+regex = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
