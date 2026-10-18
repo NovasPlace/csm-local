@@ -83,12 +83,14 @@ A checkpoint is saved through MCP; no real model is used for these fixtures.
 - `SHA256SUMS.txt`, `release-manifest.json`, and `VERIFICATION.json`:
   archive hashes, build metadata, and the extracted-artifact verification.
 
-All 175 source tests, 127 extracted-package checks, and five simulated Codex
-app-connection cases pass. Core memory capture/briefings have been observed on
-both hosts. A real idle Claude desktop chat woke, read and acknowledged its
-test message, and replied without a new human prompt. Codex's real idle check
-is pending; its active-chat deferral passed. Native host receipts are distinct
-from automated package assertions.
+All 175 source tests, extracted-package checks, and five simulated Codex
+app-connection cases pass. See VERIFICATION.json for the package assertion
+count. Core memory capture/briefings have been observed on both hosts. Real
+idle Claude and Codex desktop chats each woke and explicitly acknowledged a
+test message without a new human prompt in the receiving chat. The Codex test
+used a real Claude sender. An earlier synthetic self-test timed out and is
+retained as unsuccessful; wake remains experimental and version-dependent.
+Native host receipts are distinct from automated package assertions.
 
 ## Before submitting
 

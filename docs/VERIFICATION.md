@@ -8,8 +8,9 @@ The package verifier exercises the extracted executable with isolated Unicode
 and space-containing Windows paths: dry-run, install, backups, status,
 idempotence, fourteen MCP tools, separate-process messaging, retries,
 acknowledgment, native background-hook signaling, worker lifecycle, disable,
-and uninstall preserving unrelated settings and saved data. All 127 extracted-package checks passed on the review build. See the external
-VERIFICATION.json shipped beside the archives for exact results and hashes.
+and uninstall preserving unrelated settings and saved data. The extracted-package
+checks pass. See the external VERIFICATION.json shipped beside the archives for
+the exact assertion count and hashes; lifecycle polling can vary that count.
 
 The Codex named-pipe contract suite covers idle acceptance, busy deferral,
 missing tools, oversized frames, and lost send receipts. The fake host never
@@ -18,11 +19,17 @@ chat without submitting a message.
 
 Core capture, automatic briefings, and MCP retrieval have been observed on
 Codex Desktop and Claude Code desktop. This does not establish every host
-version or the new wake behavior. A Claude desktop chat was confirmed idle with an armed watcher on the development 0.3 build.
+version. A Claude desktop chat was confirmed idle with an armed watcher on the
+development 0.3 build.
 A real message triggered its native background hook; the recipient read it,
 explicitly acknowledged it, and replied that no new human prompt was involved.
 The earlier isolated CLI fixture failed authentication; that failure is retained
-separately. Real Codex idle pickup remains pending a post-turn check.
+separately. A later real Claude-to-Codex test also passed: a message to this idle
+Codex chat triggered the native app wake, and this same chat read and explicitly
+acknowledged it without a new human prompt. An earlier synthetic self-test timed
+out with an uncertain receipt and is retained as unsuccessful. It was not
+replayed automatically. One successful wake does not establish reliability
+across host versions or recovery from every app delay.
 
 Idle wake is experimental, off by default, and version-dependent. Windows 11
 x64 is the tested operating system. Other Windows setups, ARM64, macOS,
