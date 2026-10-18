@@ -267,7 +267,9 @@ mod tests {
         assert_redacted("hf hf_AbCdEfGhIjKlMnOpQrStUvWxYz012345", "AbCdEfGh");
         assert_redacted("npm npm_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", "AbCdEfGh");
         assert_redacted("dckr_pat_AbCdEfGhIjKlMnOpQrStUv", "AbCdEfGh");
-        assert_redacted("key=AIzaSyA1234567890abcdefghijklmnopqrstuv", "AIzaSyA12345");
+        // Assemble an obvious dummy so source scanners do not flag a complete key.
+        let google_fixture = format!("{}{}", "AIza", "0".repeat(35));
+        assert_redacted(&format!("google {google_fixture} here"), &google_fixture);
         assert_redacted("curl https://hooks.slack.com/services/T000/B000/XXXXsecretXXXX", "XXXXsecret");
         assert_redacted("https://discord.com/api/webhooks/123456/AbCdEf-secret_tok", "AbCdEf-secret");
     }
