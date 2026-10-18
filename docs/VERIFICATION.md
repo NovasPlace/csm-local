@@ -33,8 +33,9 @@ across host versions or recovery from every app delay.
 
 Idle wake is experimental, off by default, and version-dependent. Windows 11
 x64 is the tested operating system. Other Windows setups, ARM64, macOS,
-Linux, marketplace acceptance, runtime hosting, and public publishing were not
-verified or performed by packaging. No private database or user settings are
-included in the archives.
+Linux and marketplace acceptance are not covered. The package verifier does not
+publish or contact GitHub; the separate upload check verifies hosted asset
+hashes and public downloads. No private database or user settings are included
+in the archives.
 
 Runtime SHA-256: `69d825e639a2a3c4cd3153323cf062aa6b5a80f16a7b1e98b508f6fbee39fba3`.

@@ -5,7 +5,7 @@ description: Recall project decisions and previous work with CSM, and save user-
 
 # CSM project memory
 
-Use CSM to recover relevant project context and maintain concise, evidence-based continuity. This skill supplies instructions; the separate `csm-local-0.3.0-windows-x64.zip` supplies the executable. The seller must supply that runtime alongside the marketplace offering. Agensi delivery of this text skill does not install the runtime. The supported release target is Windows x64 with Codex and Claude Code.
+Use CSM to recover relevant project context and maintain concise, evidence-based continuity. This skill supplies instructions; the separate `csm-local-0.3.0-windows-x64.zip` supplies the executable. Download the free runtime from the public GitHub release linked in [setup](references/setup.md). Agensi delivery of this text skill does not install the runtime. The supported release target is Windows x64 with Codex and Claude Code.
 
 ## Scope and authority
 

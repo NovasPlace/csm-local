@@ -1,8 +1,9 @@
 # Agensi listing: CSM Project Memory 0.3.0
 
-Local review package. No submission, public download, or message to Agensi has
-been made. The 0.1.3 release is preserved. Choose runtime hosting and price
-before publishing; insert the verified download link and rebuild afterward.
+The companion runtime and source are hosted in their own public repository:
+[https://github.com/NovasPlace/csm-local](https://github.com/NovasPlace/csm-local). The 0.1.3 release is preserved. Price and
+Agensi submission remain undecided; no marketplace submission or message to
+Agensi is included in GitHub publication.
 
 ## Listing fields
 
@@ -46,7 +47,7 @@ and/or Codex installation, using your existing account and usage allowance.
 No Rust, Python, Node.js, database server, or administrator access is needed
 to run the supplied executable. The runtime is unsigned.
 
-**Runtime download:** [insert the agreed public download link before publishing].
+**Runtime download:** [Free CSM Local 0.3.0 for Windows x64](https://github.com/NovasPlace/csm-local/releases/download/v0.3.0/csm-local-0.3.0-windows-x64.zip).
 
 **Limits:** Search is keyword-based. Capture stores bounded excerpts rather
 than full transcripts. Credential redaction uses patterns and is not a
@@ -94,8 +95,8 @@ Native host receipts are distinct from automated package assertions.
 
 ## Before submitting
 
-1. Choose where to host the companion runtime. No hosting is created by this
-   package. Add the download link to this listing and the skill setup reference.
+1. Verify the [public runtime download](https://github.com/NovasPlace/csm-local/releases/download/v0.3.0/csm-local-0.3.0-windows-x64.zip) and
+   [release checksums](https://github.com/NovasPlace/csm-local/releases/tag/v0.3.0).
 2. Choose free or paid. The earlier draft records an unresolved question about
    paid listings depending on a separate free runtime; confirm the current
    marketplace rules before making a paid offer. No price is assumed here.

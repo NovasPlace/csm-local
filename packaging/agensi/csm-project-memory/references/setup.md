@@ -1,6 +1,6 @@
 # Install the companion runtime
 
-The skill is text-only. Obtain `csm-local-0.3.0-windows-x64.zip` separately from the seller through the agreed delivery channel. Use the Agensi agent connection for the purchased skill; copying or exporting a paid skill is not required by this setup.
+The skill is text-only. Download [`csm-local-0.3.0-windows-x64.zip`](https://github.com/NovasPlace/csm-local/releases/download/v0.3.0/csm-local-0.3.0-windows-x64.zip) from the free public GitHub release. Checksums and source are available on the [release page](https://github.com/NovasPlace/csm-local/releases/tag/v0.3.0). Use the Agensi agent connection for the purchased skill; copying or exporting a paid skill is not required by this setup.
 
 This release targets Windows x64 with Codex and Claude Code; both were verified in live use (Codex Desktop and Claude Code desktop). No claim is made about every host version or other operating systems. CSM itself needs no cloud account or API key. The coding host keeps its own account and usage requirements.
 

@@ -7,6 +7,17 @@ your agent to save, and supplies a compact briefing when a new session starts.
 It is a local command-line executable with a fourteen-tool MCP server. It does not
 host an AI model or require a CSM account, subscription, or API key.
 
+## Download
+
+[Download CSM 0.3.0 for Windows x64](https://github.com/NovasPlace/csm-local/releases/download/v0.3.0/csm-local-0.3.0-windows-x64.zip)
+
+[All release files and SHA-256 checksums](https://github.com/NovasPlace/csm-local/releases/tag/v0.3.0) ·
+[Source repository](https://github.com/NovasPlace/csm-local)
+
+The free MIT-licensed runtime is unsigned and was tested on Windows 11 x64.
+Extract the ZIP, then follow the installation steps below. Your existing Claude
+Code or Codex account is required; CSM does not supply model access.
+
 ## Local coordination
 
 Optional messaging lets authorized Claude Code and Codex sessions discover each
@@ -135,9 +146,9 @@ CSM/AgentBook platform. It uses keyword search, has no embeddings or cloud sync,
 and does not import the original CSM database. Do not point it at an original CSM
 database.
 
-The Agensi skill archive contains text instructions only. This runtime archive
-must be supplied separately through an agreed delivery channel. No Agensi
-approval, paid listing, or hosted runtime download is implied by these files.
+The Agensi skill archive contains text instructions only. Download the companion
+runtime separately from the public GitHub release linked above. GitHub hosting
+does not imply Agensi approval or a paid marketplace listing.
 Release details are in [the release notes](docs/RELEASE-NOTES.md).
 
 ## Building from source
