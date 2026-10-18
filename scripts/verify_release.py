@@ -14,6 +14,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 import tomllib
 from urllib.parse import unquote, urlsplit
 import zipfile
@@ -115,8 +116,11 @@ def verify_skill(files, verify):
     for name, text in texts.items():
         if not name.endswith(".md"):
             continue
-        links = re.findall(r"!?\[[^\]]*\]\(([^)]+)\)", text)
-        links += re.findall(r"(?m)^\s*\[[^\]]+\]:\s*(\S+)", text)
+        # Code blocks are not Markdown: `[Console]::OutputEncoding` there is
+        # PowerShell, not a reference-link definition.
+        prose = re.sub(r"(?ms)^\s*```.*?^\s*```", "", text)
+        links = re.findall(r"!?\[[^\]]*\]\(([^)]+)\)", prose)
+        links += re.findall(r"(?m)^\s*\[[^\]]+\]:\s*(\S+)", prose)
         for raw in links:
             target = raw.strip().strip("<>").split(' "', 1)[0]
             parsed = urlsplit(target)
@@ -138,7 +142,7 @@ def verify_skill(files, verify):
 def isolated_env(home, temp):
     env = os.environ.copy()
     for key in ("CSM_HOME", "CSM_DB", "CLAUDE_PROJECT_DIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
-                "CSM_CAPTURE_TEXT", "CSM_BRIEF_BYTES"):
+                "CSM_CAPTURE_TEXT", "CSM_BRIEF_BYTES", "CODEX_APP_TOOLS_PIPE_PATH", "CODEX_THREAD_ID", "CODEX_SESSION_ID"):
         env.pop(key, None)
     env.update({"USERPROFILE": str(home), "HOME": str(home), "CSM_CLAUDE_CLI": "none",
                 "TEMP": str(temp), "TMP": str(temp)})
@@ -147,6 +151,104 @@ def isolated_env(home, temp):
 
 def read_json(path):
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def verify_coordination(csm, installed, project, db, env, home, verify):
+    identities = {}
+    for host in ("codex", "claude"):
+        payload = {"hook_event_name": "SessionStart", "session_id": "package-" + host,
+                   "cwd": str(project), "source": "startup"}
+        output = csm("packaged_" + host + "_identity", "hook", host, "--messaging",
+                     binary=installed, input_bytes=json.dumps(payload).encode())
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        identities[host] = json.loads(context.splitlines()[-1])
+
+    def mcp_batch(host, calls):
+        identity = identities[host]
+        requests = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "packaged-coordination", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+        calls = [("csm_connect", {key: identity[key] for key in ("host", "session_id", "binding_token")}), *calls]
+        for i, (name, arguments) in enumerate(calls, 2):
+            requests.append({"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                             "params": {"name": name, "arguments": arguments}})
+        wire = ("\n".join(json.dumps(r) for r in requests) + "\n").encode()
+        replies = csm("packaged_" + host + "_mcp_exchange", "mcp", "--project", str(project),
+                      binary=installed, input_bytes=wire)
+        by_id = {r["id"]: r for r in map(json.loads, replies.splitlines())}
+        values = []
+        for i in range(2, len(calls) + 2):
+            result = by_id[i]["result"]
+            verify.check("packaged_messaging_tool_succeeds", not result.get("isError"))
+            values.append(json.loads(result["content"][0]["text"]))
+        return values[1:]
+
+    target = identities["codex"]["your_address"]
+    send = {"to": target, "content": "Packaged MCP message 日本語 ü.", "request_id": "release-coordination-1"}
+    sent = mcp_batch("claude", [("csm_peers", {}), ("csm_send", send), ("csm_send", send)])
+    message_id = sent[1]["message"]["id"]
+    verify.check("packaged_peers_do_not_expose_binding_tokens", all(
+        identity["binding_token"] not in json.dumps(sent) for identity in identities.values()))
+    verify.check("packaged_send_retry_is_idempotent", message_id == sent[2]["message"]["id"])
+    received = mcp_batch("codex", [("csm_inbox", {}), ("csm_ack", {"ids": [message_id]}),
+                                  ("csm_inbox", {})])
+    verify.check("packaged_inbox_preserves_unicode", received[0]["messages"][0]["content"] == send["content"])
+    verify.check("packaged_recipient_ack_clears_inbox", received[1]["acknowledged"] == 1
+                 and not received[2]["messages"])
+
+    verify.check("packaged_wake_is_off_by_default", not json.loads(csm(
+        "packaged_wake_default", "wake", "status", binary=installed))["enabled"])
+    csm("packaged_wake_hook_dry_run", "setup", "--messaging", "--wakeup", "--dry-run", binary=installed)
+    csm("packaged_wake_hook_install", "setup", "--messaging", "--wakeup", "--yes", binary=installed)
+    settings = read_json(home / ".claude/settings.json")
+    wake_hooks = [h for group in settings["hooks"]["Stop"] for h in group["hooks"] if h.get("asyncRewake")]
+    verify.check("packaged_native_wake_hook_is_configured", len(wake_hooks) == 1
+                 and "wake-hook claude" in wake_hooks[0]["command"] and wake_hooks[0]["timeout"] == 604800)
+    payload = {"hook_event_name": "Stop", "session_id": "package-claude", "cwd": str(project)}
+    csm("packaged_claude_idle_boundary", "hook", "claude", "--messaging", binary=installed,
+        input_bytes=json.dumps(payload).encode())
+    csm("packaged_wake_enable", "wake", "enable", binary=installed)
+    watcher = None
+    try:
+        watcher = subprocess.Popen([str(installed), "wake-hook", "claude", "--db", str(db),
+                                    "--timeout-seconds", "10"], cwd=project, env=env,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+        watcher.stdin.write(json.dumps(payload).encode())
+        watcher.stdin.close()
+        watcher.stdin = None
+        deadline = time.monotonic() + 5
+        state = {}
+        while time.monotonic() < deadline:
+            state = json.loads(csm("packaged_wake_liveness", "wake", "status", binary=installed))
+            if state["claude_watchers"] == 1 and state["live_watchers"] == 2:
+                break
+            time.sleep(0.1)
+        verify.check("packaged_background_workers_survive_launcher", state.get("claude_watchers") == 1
+                     and state.get("live_watchers") == 2)
+        raw_body = "UNTRUSTED_PACKAGE_WAKE_BODY"
+        message = json.loads(csm("packaged_wake_send", "send", "--from", target,
+            "--to", identities["claude"]["your_address"], "--request-id", "release-wake-1", raw_body, binary=installed))
+        stdout, stderr = watcher.communicate(timeout=8)
+        verify.check("packaged_background_hook_signals_real_inbox", watcher.returncode == 2 and not stdout
+                     and b"csm_inbox" in stderr and raw_body.encode() not in stderr)
+        status = json.loads(csm("packaged_wake_receipt", "message-status", "--peer", target,
+                               str(message["message"]["id"]), binary=installed))
+        verify.check("packaged_wake_delivery_is_not_acknowledgment", status["status"] == "delivered"
+                     and status["message"]["acknowledged_at"] is None)
+    finally:
+        if watcher and watcher.poll() is None:
+            watcher.kill()
+            watcher.wait(timeout=5)
+        csm("packaged_wake_disable", "wake", "disable", binary=installed)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = json.loads(csm("packaged_wake_shutdown", "wake", "status", binary=installed))
+            if state["live_watchers"] == 0:
+                break
+            time.sleep(0.1)
+        verify.check("packaged_disable_stops_workers", not state["enabled"] and state["live_watchers"] == 0)
 
 
 def verify_runtime(exe, base, skill, version, verify):
@@ -211,10 +313,11 @@ def verify_runtime(exe, base, skill, version, verify):
     wire = ("\n".join(json.dumps(request, ensure_ascii=False) for request in requests) + "\n").encode("utf-8")
     replies = csm("packaged_mcp_stdio", "mcp", "--project", str(project), binary=installed, input_bytes=wire)
     messages = {item["id"]: item for item in map(json.loads, replies.splitlines())}
-    expected_tools = {"csm_save", "csm_search", "csm_list", "csm_delete", "csm_status", "csm_brief", "csm_checkpoint"}
+    expected_tools = {"csm_save", "csm_search", "csm_list", "csm_delete", "csm_status", "csm_brief", "csm_checkpoint",
+                      "csm_connect", "csm_peers", "csm_send", "csm_inbox", "csm_ack", "csm_message_status", "csm_wait"}
     verify.check("mcp_initialize_succeeds", messages[1]["result"]["serverInfo"]["version"] == version)
-    verify.check("mcp_exposes_exactly_seven_tools", {tool["name"] for tool in messages[2]["result"]["tools"]} == expected_tools
-                 and len(messages[2]["result"]["tools"]) == 7)
+    verify.check("mcp_exposes_exactly_fourteen_tools", {tool["name"] for tool in messages[2]["result"]["tools"]} == expected_tools
+                 and len(messages[2]["result"]["tools"]) == 14)
     result = messages[3]["result"]
     verify.check("mcp_recalls_unicode_checkpoint", not result.get("isError") and checkpoint in result["content"][0]["text"])
 
@@ -242,6 +345,7 @@ def verify_runtime(exe, base, skill, version, verify):
     verify.check("documented_skill_smoke_is_isolated", len(list(scratch.glob("csm-smoke-*/smoke.db"))) == 1
                  and not (home / ".csm/csm.db").exists())
 
+    verify_coordination(csm, installed, project, db, env, home, verify)
     csm("uninstall_removes_registrations", "setup", "--uninstall", "--yes", binary=installed)
     for path, data in originals.items():
         if path.suffix == ".toml":

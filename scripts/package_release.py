@@ -97,7 +97,8 @@ def main():
         raise ValueError("Release ZIPs already exist; use a new output directory to preserve the previous build")
 
     runtime = {name: file_bytes(ROOT / name) for name in (
-        "README.md", "LICENSE", "docs/PRIVACY.md", "docs/RECOVERY.md", "docs/RELEASE-NOTES.md"
+        "README.md", "LICENSE", "docs/PRIVACY.md", "docs/RECOVERY.md", "docs/RELEASE-NOTES.md",
+        "docs/LIVE-MESSAGING.md", "docs/IDLE-WAKE.md", "docs/VERIFICATION.md"
     )}
     runtime["csm.exe"] = binary
     with tempfile.TemporaryDirectory(prefix="csm-notices-") as staging:
@@ -131,6 +132,7 @@ def main():
     (output / "AGENSI-LISTING-DRAFT.md").write_bytes(file_bytes(ROOT / "packaging/AGENSI-LISTING.md"))
     manifest = {
         "version": version, "platform": "windows-x64", "runtime_sha256": digest(binary),
+        "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "runtime_signed": False, "marketplace_submitted": False,
         "runtime_delivery_confirmed": False,
         "pe_dependencies": imports,

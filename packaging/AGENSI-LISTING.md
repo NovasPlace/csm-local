@@ -1,72 +1,105 @@
-# Agensi submission draft — CSM Project Memory
+# Agensi listing: CSM Project Memory 0.3.0
 
-Status: prepared locally for review. Not submitted or approved. No price or
-publishing decision has been made.
+Local review package. No submission, public download, or message to Agensi has
+been made. The 0.1.3 release is preserved. Choose runtime hosting and price
+before publishing; insert the verified download link and rebuild afterward.
 
-## Listing title
+## Listing fields
 
-CSM Project Memory — Private Checkpoints for Codex on Windows
+**Title**
+CSM: Private Memory for Claude Code and Codex
 
-## Short description
+**Skill name**
+`csm-project-memory`
 
-Save project decisions and progress checkpoints, then resume work in a fresh
-Codex session using local memory. Includes a guided workflow for setup, recall,
-verification and recovery with the CSM Local runtime.
+**Tagline**
+Your coding agents remember where you left off, on your own machine.
+
+**Category**
+Agents & Orchestration (confirm against the submission form)
+
+**Tags**
+claude-code, codex, memory, mcp, hooks, handoff, local-first, windows
 
 ## Description
 
-Stop reconstructing the same project handoff after every new session. This skill
-helps your coding agent keep useful facts separate from an activity log, record
-what is finished and what remains, and check a saved handoff before continuing.
+Keep project decisions and work history across coding sessions. CSM records a
+short local activity journal and gives a new session a compact briefing of
+previous work, checkpoints, unresolved failures, and saved decisions. Claude
+Code and Codex share the same project memory.
 
-CSM Local stores records in a local SQLite database. It needs no CSM cloud
-account, database service or separate API key. The agent you already use still
-needs its normal access and allowance. Recalled context is sent to that agent;
-local storage is not a promise that its model provider never receives it.
+- Automatic capture through host hooks; important decisions and lessons are
+  saved explicitly when requested.
+- Checkpoints with next steps and blockers, available through MCP tools.
+- Keyword search and a local SQLite database, without a CSM account or API key.
+- Optional addressed messages between authorized local sessions, with explicit
+  acknowledgments and retry IDs.
+- Installation preview, configuration backups, status checks, and uninstall.
 
-Included workflow: inspect setup; select the correct project; recall prior
-context; save user-authorized decisions; capture checkpoints; verify fresh-session
-delivery; inspect/delete project records and recover configuration backups.
+This skill contains instructions. The companion MIT-licensed runtime is a
+separate Windows x64 download. Extract it, check the supplied checksum, preview
+`setup --dry-run`, then run `setup --yes`. Setup does not add CSM to PATH; use
+`.\csm.exe` in the extracted folder or the full installed path.
 
-Requirements: Windows x64, PowerShell, a compatible Codex installation, and the
-separately supplied CSM Local 0.1.3 runtime. The runtime is unsigned. This listing
-does not promise Claude live-session compatibility, other operating systems,
-semantic/vector search, full transcripts, or migration from the original CSM.
+**Requirements:** Windows x64, tested on Windows 11; a compatible Claude Code
+and/or Codex installation, using your existing account and usage allowance.
+No Rust, Python, Node.js, database server, or administrator access is needed
+to run the supplied executable. The runtime is unsigned.
 
-Suggested category: Agents & Orchestration or Productivity.
-Suggested tags: codex, windows, project-memory, checkpoints, local-first, mcp.
+**Runtime download:** [insert the agreed public download link before publishing].
 
-## Runtime delivery decision before a paid listing
+**Limits:** Search is keyword-based. Capture stores bounded excerpts rather
+than full transcripts. Credential redaction uses patterns and is not a
+secrecy guarantee. Treat your database as private. Briefings and messages sent
+to your coding agent reach that host's model provider under its policies.
 
-The submission ZIP contains only text. The companion Windows runtime ZIP is
-prepared separately; do not place its executable inside the skill upload.
-No hosted download URL has been invented and no repository/release has been
-published. Confirm with Agensi how the buyer obtains the companion runtime
-without another purchase, signup or entitlement step. If that cannot be provided,
-do not claim immediate self-contained paid delivery. A clearly disclosed free
-runtime-linked listing is another route described in the supplied seller email.
+Idle wake-up is an **experimental optional feature**, off by default, for
+compatible open hosts. Claude requires its native background hook; Codex
+Desktop requires a version-dependent local app connection. Closed hosts retain
+queued messages. Automated adapter checks do not establish live idle pickup;
+see the package verification report. Do not list autonomous idle coordination
+as an established core product guarantee.
 
-The seller must decide price and publish scope, complete the marketplace's seller
-onboarding/payout requirements, and obtain review. The local tests do not replace
-Agensi's approval or demonstrate likely sales.
+## Images
 
-## Draft delivery question for the existing Agensi conversation
+Use these from `listing-images/`. Headlines are editorial; terminal panels
+are actual release output from isolated demo data. Temporary roots are mapped
+to a buyer-style `C:/Users/dev` profile before saving text or rendering images.
+A checkpoint is saved through MCP; no real model is used for these fixtures.
 
-"We've prepared a focused Windows/Codex continuity skill and a standalone local
-runtime. The skill ZIP is text-only; the runtime is a separate Windows ZIP with
-checksums, setup instructions and license notices. What is your approved way to
-deliver that runtime to a paid buyer alongside the skill, with no separate
-purchase or service access requirement?"
+| File | Alt text |
+| --- | --- |
+| `1-cover.png` | A compact CSM project briefing for the next coding session. |
+| `2-briefing.png` | Codex startup receives a demo checkpoint saved through MCP. |
+| `3-setup-dry-run.png` | The release executable previews configuration changes for both hosts. |
+| `4-install.png` | Isolated setup installs with backups, then status reports registrations. |
 
-This is a draft only; no message has been sent.
+## Local delivery files
 
-## Rules checked on 2026-10-14
+- `csm-project-memory-0.3.0-agensi.zip`: text-only skill upload.
+- `csm-local-0.3.0-windows-x64.zip`: companion executable, documentation,
+  MIT license, third-party notices, and internal checksums.
+- `csm-local-0.3.0-source.zip`: complete source and tests, without private data.
+- `SHA256SUMS.txt`, `release-manifest.json`, and `VERIFICATION.json`:
+  archive hashes, build metadata, and the extracted-artifact verification.
 
-- https://www.agensi.io/security — text skill screening; compiled files may be
-  flagged or blocked.
-- https://www.agensi.io/learn/skill-md-creator-checklist — one top-level skill
-  folder, valid frontmatter, supporting references, no symlinks or binaries.
-- https://www.agensi.io/sell — listing/review process and seller requirements.
+All 175 source tests, 127 extracted-package checks, and five simulated Codex
+app-connection cases pass. Core memory capture/briefings have been observed on
+both hosts. A real idle Claude desktop chat woke, read and acknowledged its
+test message, and replied without a new human prompt. Codex's real idle check
+is pending; its active-chat deferral passed. Native host receipts are distinct
+from automated package assertions.
 
-The supplied Joeri Brons email allows a local runtime and asks a paid listing to
-deliver its promised functionality without separate external-service access.
+## Before submitting
+
+1. Choose where to host the companion runtime. No hosting is created by this
+   package. Add the download link to this listing and the skill setup reference.
+2. Choose free or paid. The earlier draft records an unresolved question about
+   paid listings depending on a separate free runtime; confirm the current
+   marketplace rules before making a paid offer. No price is assumed here.
+3. Rebuild into a fresh directory after final edits, run the release verifier,
+   and inspect the final listing images. Submit the text-only skill only after
+   Donovan authorizes publication.
+
+The existing 0.1.3 pricing discussion and draft correspondence remain in
+commit 2412114; they are not sent or treated as current marketplace approval.

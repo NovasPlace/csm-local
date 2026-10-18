@@ -1,6 +1,6 @@
 [package]
 name = "csm-local"
-version = "0.1.3"
+version = "0.3.0"
 edition = "2021"
 description = "Local-first, private cross-session memory for coding agents"
 license = "MIT"

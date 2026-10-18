@@ -1,13 +1,14 @@
 //! Local-first, private cross-session memory for coding agents.
 //!
 //! Everything lives in a single SQLite file on the user's machine. Nothing in
-//! this crate opens a network connection.
+//! this crate opens an external network connection. Opt-in wake adapters use local host IPC.
 
 pub mod brief;
 pub mod capture;
 pub mod hook;
 pub mod journal;
 pub mod mcp;
+pub mod messaging;
 pub mod paths;
 pub mod project;
 pub mod redact;
@@ -15,6 +16,7 @@ pub mod setup;
 pub mod store;
 mod text;
 mod time;
+pub mod wake;
 
 use std::fmt;
 

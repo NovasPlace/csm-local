@@ -5,7 +5,7 @@ description: Recall project decisions and previous work with CSM, and save user-
 
 # CSM project memory
 
-Use CSM to recover relevant project context and maintain concise, evidence-based continuity. This skill supplies instructions; the separate `csm-local-0.1.3-windows-x64.zip` supplies the executable. The seller must supply that runtime alongside the marketplace offering. Agensi delivery of this text skill does not install the runtime. The supported release target is Windows x64 with Codex. Claude Code installation is available as a preview; live fresh-session verification remains pending.
+Use CSM to recover relevant project context and maintain concise, evidence-based continuity. This skill supplies instructions; the separate `csm-local-0.3.0-windows-x64.zip` supplies the executable. The seller must supply that runtime alongside the marketplace offering. Agensi delivery of this text skill does not install the runtime. The supported release target is Windows x64 with Codex and Claude Code.
 
 ## Scope and authority
 
@@ -26,3 +26,12 @@ Use CSM to recover relevant project context and maintain concise, evidence-based
 If CSM tools are absent, use the installed CLI with an explicit project path. If the runtime is absent, explain the separate dependency and follow [setup](references/setup.md) only within the user's installation request. Do not improvise a download URL or execute a remote installer.
 
 For user-requested testing, [operations](references/operations.md#isolated-smoke-test) provides a temporary-database scenario. Do not seed a real project's memory merely to demonstrate the product.
+
+## Optional session messaging
+
+When the user authorizes coordination with another local session, use the
+runtime's `csm_connect`, `csm_peers`, `csm_send`, `csm_inbox`, `csm_ack`,
+`csm_message_status`, and `csm_wait` tools. See
+[messaging and experimental wake-up](references/messaging.md) when enabling or
+using that feature. Loading this skill does not authorize contacting other
+sessions or enabling background work.

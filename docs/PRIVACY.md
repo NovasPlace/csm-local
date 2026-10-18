@@ -19,6 +19,17 @@ content the user or agent deliberately supplies. Common credential patterns are
 redacted, but redaction is best-effort and is not a guarantee that every secret
 will be recognized. Avoid saving secrets or confidential material unnecessarily.
 
+Opt-in messaging also stores session addresses, private connection tokens,
+message bodies, routing metadata, and delivery/acknowledgment timestamps in
+separate local tables. Message context reaches the recipient's model provider
+under that host's policies. Tokens are absent from peer discovery and message
+results. Message expiry stops delivery but does not delete history; project
+`forget` deletes its peers and messages in both directions.
+
+Experimental idle wake also stores private local app routes and bounded job receipts.
+`wake status` excludes those route paths and binding tokens. `wake disable` stops
+future notifications; an accepted host turn may already be running.
+
 Prompt/reply capture defaults on. To disable that text capture, set
 `CSM_CAPTURE_TEXT=0` in the environment inherited by the agent and restart it.
 This does not disable tool-event capture, already stored text, explicit memory
@@ -48,6 +59,9 @@ $project = (Get-Location).Path
 ```
 
 Export is JSON for inspection and portability; this release has no import command.
+It includes memories and journal records, not mailbox tables. Use `peers`,
+`inbox`, and `message-status` to inspect messaging. A database backup includes all
+tables, including retained message history.
 For a restorable database backup, stop agents and CSM processes and copy the data
 directory as described in the recovery guide, or use a SQLite-aware backup tool.
 
@@ -61,8 +75,9 @@ directory as described in the recovery guide, or use a SQLite-aware backup tool.
 & $csm forget --project $project --yes
 ```
 
-This removes saved memories, checkpoints and journal events for that project in
-the selected database. It does not erase exports, filesystem backups, agent
+This removes saved memories, checkpoints, journal events, messaging peers, and
+messages to or from that project in the selected database. Use version 0.2 or
+later to include mailbox data. It does not erase exports, filesystem backups, agent
 transcripts or information already sent to a model provider. If CSM reports that
 database scrubbing was incomplete because another connection is busy, close the
 other connections and follow its reported instructions. Filesystem/SSD backups

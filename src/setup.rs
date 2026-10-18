@@ -75,7 +75,16 @@ const CODEX_HOOKS: &[HookSpec] = &[
 const MCP_NAME: &str = "csm";
 
 static CSM_HOOK_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)^\s*(?:&\s+)?(?:"(?:[^"\r\n]*[\\/])?csm(?:\.exe)?"|'(?:[^'\r\n]*[\\/])?csm(?:\.exe)?'|(?:[^\s"'&;|<>]*[\\/])?csm(?:\.exe)?)\s+hook\s+(?:claude|codex)(?:\s+--db\s+(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s"'&;|<>]+))?\s*$"#).unwrap()
+    Regex::new(r#"(?i)^\s*(?:&\s+)?(?:"(?:[^"\r\n]*[\\/])?csm(?:\.exe)?"|'(?:[^'\r\n]*[\\/])?csm(?:\.exe)?'|(?:[^\s"'&;|<>]*[\\/])?csm(?:\.exe)?)\s+hook\s+(?:claude|codex)(?:\s+--db\s+(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s"'&;|<>]+))?(?:\s+--messaging)?\s*$"#).unwrap()
+});
+static CSM_WAKE_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        &CSM_HOOK_COMMAND
+            .as_str()
+            .replace(r"\s+hook\s+(?:claude|codex)", r"\s+wake-hook\s+claude")
+            .replace(r"(?:\s+--messaging)?", ""),
+    )
+    .unwrap()
 });
 
 /// Where things are, resolved once. Fields are public so tests can point
@@ -143,6 +152,15 @@ impl SetupEnv {
         }
     }
 
+    fn messaging_hook_command(&self, agent: Agent, enabled: bool) -> String {
+        let command = self.hook_command(agent);
+        if enabled {
+            format!("{command} --messaging")
+        } else {
+            command
+        }
+    }
+
     fn mcp_args(&self) -> Vec<String> {
         let mut args = self.db_args();
         args.push("mcp".into());
@@ -155,6 +173,9 @@ pub struct Options {
     pub dry_run: bool,
     pub yes: bool,
     pub uninstall: bool,
+    /// Opt in to automatic session inbox delivery at supported hook boundaries.
+    pub messaging: bool,
+    pub wakeup: bool,
     /// Restrict to these agents; empty means every one found.
     pub only: Vec<Agent>,
 }
@@ -250,8 +271,22 @@ fn plan_claude(env: &SetupEnv, opts: &Options, plan: &mut Plan) -> Result<()> {
     let settings = env.home.join(".claude").join("settings.json");
     let before = read_optional(&settings)?;
     let mut root = parse_json_object(before.as_deref(), &settings)?;
-    let wanted = if opts.uninstall { &[][..] } else { CLAUDE_HOOKS };
-    merge_hooks(&mut root, wanted, &env.hook_command(Agent::Claude))?;
+    let wakeup = opts.wakeup || has_wake_hooks(&root);
+    let messaging = opts.messaging || wakeup || has_messaging_hooks(&root);
+    let expanded = inbox_hooks(CLAUDE_HOOKS, messaging);
+    let wanted = if opts.uninstall { &[][..] } else { &expanded };
+    merge_hooks(&mut root, wanted, &env.messaging_hook_command(Agent::Claude, messaging))?;
+    if wakeup && !opts.uninstall {
+        let command = env.hook_command(Agent::Claude).replacen(" hook claude", " wake-hook claude", 1);
+        if let Some(groups) = root.get_mut("hooks").and_then(|h| h.get_mut("Stop")).and_then(Value::as_array_mut) {
+            if let Some(group) = groups.iter_mut().find(|g| is_csm_group(g)) {
+                group["hooks"]
+                    .as_array_mut()
+                    .expect("CSM group")
+                    .push(json!({"type":"command","command":command,"asyncRewake":true,"timeout":604800}));
+            }
+        }
+    }
     let after = render_json(&root, before.as_deref());
     if before.as_deref() != Some(after.as_str()) && !(before.is_none() && opts.uninstall) {
         let describe = if opts.uninstall {
@@ -347,8 +382,10 @@ fn plan_codex(env: &SetupEnv, opts: &Options, plan: &mut Plan) -> Result<()> {
         let before = read_optional(&hooks_path)?;
         if before.is_some() || !opts.uninstall {
             let mut root = parse_json_object(before.as_deref(), &hooks_path)?;
-            let wanted = if opts.uninstall { &[][..] } else { CODEX_HOOKS };
-            merge_hooks(&mut root, wanted, &env.hook_command(Agent::Codex))?;
+            let messaging = opts.messaging || has_messaging_hooks(&root);
+            let expanded = inbox_hooks(CODEX_HOOKS, messaging);
+            let wanted = if opts.uninstall { &[][..] } else { &expanded };
+            merge_hooks(&mut root, wanted, &env.messaging_hook_command(Agent::Codex, messaging))?;
             let after = render_json(&root, before.as_deref());
             if before.as_deref() != Some(after.as_str()) {
                 let describe = if opts.uninstall {
@@ -393,6 +430,33 @@ fn plan_codex(env: &SetupEnv, opts: &Options, plan: &mut Plan) -> Result<()> {
         }));
     }
     Ok(())
+}
+
+fn inbox_hooks(specs: &[HookSpec], enabled: bool) -> Vec<HookSpec> {
+    specs
+        .iter()
+        .map(|&(event, matcher, timeout)| {
+            (event, if enabled && event == "PostToolUse" { None } else { matcher }, timeout)
+        })
+        .collect()
+}
+
+fn has_messaging_hooks(root: &Map<String, Value>) -> bool {
+    root.get("hooks").and_then(Value::as_object).is_some_and(|events| {
+        events
+            .values()
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(|g| g.get("hooks").and_then(Value::as_array))
+            .flatten()
+            .any(|handler| {
+                is_csm_handler(handler)
+                    && handler
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| command.ends_with(" --messaging"))
+            })
+    })
 }
 
 /// Replaces csm's handlers in a hooks object (`{"hooks": {Event: [group]}}`)
@@ -453,7 +517,22 @@ fn csm_group(command: &str, matcher: Option<&str>, timeout: u64) -> Value {
 }
 
 fn is_csm_handler(handler: &Value) -> bool {
-    handler.get("command").and_then(Value::as_str).is_some_and(|c| CSM_HOOK_COMMAND.is_match(c))
+    handler
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|c| CSM_HOOK_COMMAND.is_match(c) || CSM_WAKE_COMMAND.is_match(c))
+}
+
+fn has_wake_hooks(root: &Map<String, Value>) -> bool {
+    root.get("hooks")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|h| h.values())
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|g| g.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .any(|h| h.get("command").and_then(Value::as_str).is_some_and(|s| CSM_WAKE_COMMAND.is_match(s)))
 }
 
 fn is_csm_group(group: &Value) -> bool {
@@ -663,6 +742,9 @@ pub fn run(opts: Options, db: Option<PathBuf>) -> Result<()> {
     for line in apply(&env, &plan)? {
         println!("{line}");
     }
+    if opts.uninstall && opts.only.is_empty() && env.db.exists() {
+        crate::store::Store::open(&env.db)?.set_wake_enabled(false)?;
+    }
     if !opts.uninstall {
         println!("\nNext:");
         println!("  - Restart Claude Code and Codex so they load the new configuration.");
@@ -723,6 +805,24 @@ pub fn status(db: Option<PathBuf>) -> Result<Vec<String>> {
             agent.label(),
             specs.len(),
             if mcp { "registered" } else { "not registered" }
+        ));
+        if agent == Agent::Claude {
+            lines.push(format!(
+                "  idle wake hook: {}",
+                if has_wake_hooks(&root) {
+                    "configured; host must load it, and csm wake enable must be opted in"
+                } else {
+                    "off; install with csm setup --wakeup"
+                }
+            ));
+        }
+        lines.push(format!(
+            "  automatic messaging: {}",
+            if has_messaging_hooks(&root) {
+                "configured (host reload and hook trust still required)"
+            } else {
+                "off; opt in with csm setup --messaging"
+            }
         ));
     }
     Ok(lines)

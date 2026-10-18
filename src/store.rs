@@ -145,6 +145,8 @@ pub struct Hit {
 pub struct Forgotten {
     pub memories: usize,
     pub events: usize,
+    pub messages: usize,
+    pub peers: usize,
     /// False when another csm process kept the write-ahead log busy, so
     /// copies of the deleted text may remain in it until that process exits.
     pub scrubbed: bool,
@@ -199,6 +201,8 @@ impl Store {
         conn.query_row("PRAGMA secure_delete = ON", [], |_| Ok(()))?;
         let store = Store { conn, path };
         store.migrate()?;
+        store.init_messaging()?;
+        store.init_wake()?;
         Ok(store)
     }
 
@@ -385,14 +389,16 @@ impl Store {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM memories WHERE project = ?1", [project], |r| r.get(0))?)
     }
 
-    /// Every project key that has stored memories or events.
+    /// Every project key that has stored memories, events or messaging peers.
     pub fn project_keys(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT project FROM memories UNION SELECT project FROM events ORDER BY 1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT project FROM memories UNION SELECT project FROM events UNION SELECT project FROM csm_peers ORDER BY 1",
+        )?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Permanently removes every memory and journal event for a project,
+    /// Permanently removes every memory, journal event and mailbox for a project,
     /// compacts the file and flushes the write-ahead log, so the deleted
     /// text is not left behind on disk.
     pub fn forget_project(&self, project: &str) -> Result<Forgotten> {
@@ -400,10 +406,17 @@ impl Store {
         let memories = tx.execute("DELETE FROM memories WHERE project = ?1", [project])?;
         let events = tx.execute("DELETE FROM events WHERE project = ?1", [project])?;
         tx.execute("DELETE FROM injections WHERE project = ?1", [project])?;
+        // Remove both directions, including explicitly allowed cross-project messages.
+        let messages = tx.execute(
+            "DELETE FROM csm_messages WHERE from_peer IN (SELECT id FROM csm_peers WHERE project = ?1)
+             OR to_peer IN (SELECT id FROM csm_peers WHERE project = ?1)",
+            [project],
+        )?;
+        let peers = tx.execute("DELETE FROM csm_peers WHERE project = ?1", [project])?;
         tx.commit()?;
         self.conn.execute_batch("INSERT INTO memories_fts (memories_fts) VALUES ('optimize'); VACUUM;")?;
         let scrubbed = self.flush_wal()?;
-        Ok(Forgotten { memories, events, scrubbed })
+        Ok(Forgotten { memories, events, messages, peers, scrubbed })
     }
 
     /// Copies the write-ahead log into the database and truncates it, so
@@ -654,7 +667,10 @@ mod tests {
         store.save(new(P, "note", "alpha")).unwrap();
         store.save(new(P, "note", "beta")).unwrap();
         store.save(new(OTHER, "note", "alpha elsewhere")).unwrap();
-        assert_eq!(store.forget_project(P).unwrap(), Forgotten { memories: 2, events: 0, scrubbed: true });
+        assert_eq!(
+            store.forget_project(P).unwrap(),
+            Forgotten { memories: 2, events: 0, messages: 0, peers: 0, scrubbed: true }
+        );
         let stats = store.stats(Some(P)).unwrap();
         assert_eq!((stats.memories, stats.projects, stats.project_memories), (1, 1, Some(0)));
         assert_eq!(store.search("alpha", all(None)).unwrap().len(), 1);

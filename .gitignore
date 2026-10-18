@@ -1,3 +1,8 @@
 /target
 __pycache__/
 *.pyc
+/dist
+
+# Local verification fixtures contain private snapshots; review bundles live in dist.
+/qa/
+/qa-*.log

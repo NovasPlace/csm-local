@@ -1,19 +1,32 @@
-# CSM Local 0.1.3
+# CSM Local 0.3.0
 
 Private project memory and restart handoffs for coding agents.
 
 CSM records a short local activity journal, stores decisions and lessons you ask
 your agent to save, and supplies a compact briefing when a new session starts.
-It is a local command-line executable with a seven-tool MCP server. It does not
+It is a local command-line executable with a fourteen-tool MCP server. It does not
 host an AI model or require a CSM account, subscription, or API key.
+
+## Local coordination
+
+Optional messaging lets authorized Claude Code and Codex sessions discover each
+other, exchange addressed messages, and acknowledge receipt. Enable it with
+`.\csm.exe setup --messaging --yes`, then reload the hosts. See
+[delivery and coordination](docs/LIVE-MESSAGING.md).
+
+Version 0.3 also includes **experimental, opt-in idle wake-up**. Claude uses its
+native background hook; Codex Desktop uses a local app connection. Ordinary
+installs leave wake-up off. Open chats and a compatible host are required;
+closed hosts keep mail queued. See [idle wake setup and limits](docs/IDLE-WAKE.md)
+and [what was verified](docs/VERIFICATION.md).
+
 
 ## Supported release
 
 - Windows x64 runtime. PowerShell is needed for the tested Codex hook path.
-- Codex is the verified host: installation, hooks, MCP retrieval, and automatic
-  checkpoint delivery in a fresh session have been exercised.
-- Claude Code registration and hook-command tests are covered, including a fake
-  Claude CLI. Live delivery in a fresh Claude session remains unverified.
+- Codex and Claude Code are both verified hosts. On each, installation, hook
+  capture, MCP retrieval, and the automatic briefing in a fresh session have been
+  exercised in live use (Claude Code desktop and Codex Desktop, 2026-10-18).
 - An existing compatible agent installation and its normal usage allowance are
   prerequisites. CSM does not supply Claude or Codex access.
 - Default host configuration locations only: `%USERPROFILE%\.codex` and
@@ -24,16 +37,19 @@ host an AI model or require a CSM account, subscription, or API key.
 
 ## Install the downloaded Windows runtime
 
-Extract `csm-local-0.1.3-windows-x64.zip` using Windows **Extract All**. Open
+Extract `csm-local-0.3.0-windows-x64.zip` using Windows **Extract All**. Open
 PowerShell inside the extracted folder containing `csm.exe`. You do not need
 Rust, Node.js, Python, a database server, or administrator access.
 
 ```powershell
 Get-FileHash -LiteralPath .\csm.exe -Algorithm SHA256
 .\csm.exe --version
-.\csm.exe setup --only codex --dry-run
-.\csm.exe setup --only codex --yes
+.\csm.exe setup --dry-run
+.\csm.exe setup --yes
 ```
+
+Setup finds Codex and Claude Code automatically and configures each one present.
+Add `--only codex` or `--only claude` to limit it to one host.
 
 Compare the hash with the included `SHA256SUMS.txt`. A matching hash detects an
 unexpected file change; it is not a digital signature.
@@ -47,14 +63,13 @@ $csm = Join-Path $env:USERPROFILE '.csm\bin\csm.exe'
 & $csm setup --status
 ```
 
-Restart Codex, open `/hooks` if prompted, and approve the CSM hooks. Restarting an
-already connected MCP server is necessary to load a new runtime version. Existing
-simple-path hook commands are preserved by this upgrade.
+Restart Codex and Claude Code. In Codex, open `/hooks` if prompted and approve the
+CSM hooks. Restarting an already connected MCP server is necessary to load a new
+runtime version. Existing simple-path hook commands are preserved by this upgrade.
 
-For Claude Code's currently unverified live-session integration, substitute
-`--only claude` in the setup commands. Omitting `--only` detects both hosts. The
-installer prefers `claude.exe` on PATH for MCP registration; without that executable
-it edits the user JSON config directly. Close Claude before using that fallback.
+For Claude Code, the installer prefers `claude.exe` on PATH for MCP registration;
+without that executable it edits the user JSON config directly. Close Claude
+before using that fallback.
 
 ## Use project memory
 

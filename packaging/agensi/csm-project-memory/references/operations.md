@@ -24,7 +24,10 @@ CSM does not automatically promote journal activity into durable lessons. A larg
 
 For default installation paths, replace the example project with the intended existing directory:
 
+CSM prints UTF-8. Windows PowerShell 5.1 decodes program output with the console code page, which garbles non-ASCII paths and text, so set UTF-8 first in each PowerShell session:
+
 ```powershell
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $csmExe = Join-Path $env:USERPROFILE '.csm\bin\csm.exe'
 $csmProject = 'C:\work\example-project'
 & $csmExe status --project $csmProject
@@ -47,6 +50,7 @@ CLI checkpoint accepts repeatable `--next` and `--blocker`. `--goal` and `--goal
 Run this only when the user requests a functional test. It creates a unique temporary project and database, and does not configure host hooks or use the production memory database. `$csmExe` must already point to the intended executable.
 
 ```powershell
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $csmTestRoot = Join-Path $env:TEMP ('csm-smoke-' + [guid]::NewGuid().ToString('N'))
 $csmTestProject = Join-Path $csmTestRoot 'project'
 $csmTestDb = Join-Path $csmTestRoot 'smoke.db'
