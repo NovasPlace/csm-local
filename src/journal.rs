@@ -366,9 +366,10 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {EVENT_COLUMNS} FROM events
              WHERE kind IN ('edit', 'write', 'delete') AND project <> ?1 AND ts >= ?2 AND (ok IS NULL OR ok <> 0)
-               AND (instr(lower(char(10) || files), lower(char(10) || ?1 || '/')) > 0
-                    OR (substr(lower(?1), 1, length(project) + 1) = lower(project) || '/'
-                        AND instr(lower(char(10) || files), char(10) || lower(substr(?1, length(project) + 2)) || '/') > 0))
+               AND (instr(lower(char(10) || files), lower(char(10) || rtrim(?1, '/') || '/')) > 0
+                    OR (substr(lower(?1), 1, length(rtrim(project, '/')) + 1) = lower(rtrim(project, '/')) || '/'
+                        AND instr(lower(char(10) || files),
+                                  char(10) || lower(substr(?1, length(rtrim(project, '/')) + 2)) || '/') > 0))
              ORDER BY id DESC
              LIMIT ?3"
         ))?;
@@ -440,9 +441,11 @@ impl Store {
     pub fn last_injection(&self) -> Result<Option<(String, i64, i64)>> {
         Ok(self
             .conn
-            .query_row("SELECT host, bytes, ts FROM injections ORDER BY id DESC LIMIT 1", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
+            .query_row(
+                "SELECT host, bytes, ts FROM injections WHERE trigger NOT LIKE 'lease:%' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .optional()?)
     }
 

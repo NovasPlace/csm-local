@@ -328,7 +328,11 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
         }
         "PostToolUse" | "PostToolUseFailure" => {
             let mut roots = vec![project.clone()];
-            roots.extend(project::root_aliases(Path::new(dir)).into_iter().filter(|a| *a != project));
+            // Other spellings of this folder's root are only roots of the
+            // project when the folder is not linked into a different one.
+            if project::resolve(Path::new(dir)) == project {
+                roots.extend(project::root_aliases(Path::new(dir)).into_iter().filter(|a| *a != project));
+            }
             if let Some(t) = tool_event(host, payload, &roots, event_name == "PostToolUseFailure") {
                 let edited = matches!(t.kind, "edit" | "write" | "delete") && t.ok != Some(false);
                 let tool = NewEvent {
@@ -605,6 +609,23 @@ mod tests {
             json!({ "hook_event_name": "UserPromptSubmit", "session_id": "c1", "cwd": launch, "prompt": "hi" });
         send(&store, Host::Claude, prompt, 1);
         assert_eq!(events(&store)[0].project, project());
+    }
+
+    #[test]
+    fn a_linked_folder_stores_paths_outside_the_project_in_full() {
+        let store = Store::open_in_memory().unwrap();
+        let launch = "C:/work/launcher";
+        store.link_project(&project::resolve(Path::new(launch)), &project()).unwrap();
+        let write = json!({ "hook_event_name": "PostToolUse", "session_id": "c1", "cwd": launch, "tool_name": "Write",
+                            "tool_use_id": "w1", "tool_input": { "file_path": format!("{launch}/notes.md") }, "tool_response": {} });
+        send(&store, Host::Claude, write, 1);
+        let e = &events(&store)[0];
+        assert_eq!(e.project, project());
+        assert_eq!(
+            e.files,
+            [format!("{}/notes.md", project::resolve(Path::new(launch)))],
+            "not relative to the launcher"
+        );
     }
 
     /// A Claude session that edits a file and fails a test, then ends.

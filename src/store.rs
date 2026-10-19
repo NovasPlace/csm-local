@@ -147,6 +147,8 @@ pub struct Forgotten {
     pub events: usize,
     pub messages: usize,
     pub peers: usize,
+    /// Folder links into or out of the project (`csm link`).
+    pub links: usize,
     /// False when another csm process kept the write-ahead log busy, so
     /// copies of the deleted text may remain in it until that process exits.
     pub scrubbed: bool,
@@ -408,7 +410,7 @@ impl Store {
         let events = tx.execute("DELETE FROM events WHERE project = ?1", [project])?;
         tx.execute("DELETE FROM injections WHERE project = ?1", [project])?;
         tx.execute("DELETE FROM csm_file_touches WHERE project = ?1", [project])?;
-        tx.execute("DELETE FROM csm_project_links WHERE alias = ?1 OR project = ?1", [project])?;
+        let links = tx.execute("DELETE FROM csm_project_links WHERE alias = ?1 OR project = ?1", [project])?;
         // Remove both directions, including explicitly allowed cross-project messages.
         let messages = tx.execute(
             "DELETE FROM csm_messages WHERE from_peer IN (SELECT id FROM csm_peers WHERE project = ?1)
@@ -419,7 +421,7 @@ impl Store {
         tx.commit()?;
         self.conn.execute_batch("INSERT INTO memories_fts (memories_fts) VALUES ('optimize'); VACUUM;")?;
         let scrubbed = self.flush_wal()?;
-        Ok(Forgotten { memories, events, messages, peers, scrubbed })
+        Ok(Forgotten { memories, events, messages, peers, links, scrubbed })
     }
 
     /// Copies the write-ahead log into the database and truncates it, so
@@ -672,7 +674,7 @@ mod tests {
         store.save(new(OTHER, "note", "alpha elsewhere")).unwrap();
         assert_eq!(
             store.forget_project(P).unwrap(),
-            Forgotten { memories: 2, events: 0, messages: 0, peers: 0, scrubbed: true }
+            Forgotten { memories: 2, events: 0, messages: 0, peers: 0, links: 0, scrubbed: true }
         );
         let stats = store.stats(Some(P)).unwrap();
         assert_eq!((stats.memories, stats.projects, stats.project_memories), (1, 1, Some(0)));

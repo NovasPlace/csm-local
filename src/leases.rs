@@ -158,18 +158,17 @@ pub fn collision_notice(
             ago(now, touch.ts),
             who(store, &touch)?
         );
-        let trigger = format!("lease:{}:{}:{}", content_hash(&touch_key(&touch.display)), touch.host, touch.session_id);
-        let claimed = store.claim_injection(
-            project,
-            host.name(),
-            session_id,
-            agent_id,
-            &trigger,
-            Some(LEASE_WINDOW_MS),
-            &line,
-            &[],
-            now,
-        )?;
+        // Keyed by the other session's edit itself: the same edit is reported
+        // once, and a newer edit to the same file is reported again.
+        let trigger = format!(
+            "lease:{}:{}:{}:{}",
+            content_hash(&touch_key(&touch.display)),
+            touch.host,
+            touch.session_id,
+            touch.ts
+        );
+        let claimed =
+            store.claim_injection(project, host.name(), session_id, agent_id, &trigger, None, &line, &[], now)?;
         if claimed {
             sources.push(format!("{}:{}", touch.host, touch.session_id));
             lines.push(line);
@@ -254,6 +253,19 @@ mod tests {
         );
         // Once per file and session per window.
         assert!(collision_notice(&store, Host::Claude, "me", "", P, &file(), NOW + MIN).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_newer_edit_by_the_same_session_is_reported_again() {
+        let store = Store::open_in_memory().unwrap();
+        active(&store, "codex", "other", "x", NOW - 30 * MIN);
+        store.touch_files(P, "codex", "other", "", &file(), NOW - 25 * MIN).unwrap();
+        assert!(collision_notice(&store, Host::Claude, "me", "", P, &file(), NOW - 24 * MIN).unwrap().is_some());
+        active(&store, "codex", "other", "y", NOW - 6 * MIN);
+        store.touch_files(P, "codex", "other", "", &file(), NOW - 5 * MIN).unwrap();
+        let again = collision_notice(&store, Host::Claude, "me", "", P, &file(), NOW).unwrap();
+        assert!(again.is_some_and(|t| t.contains("5m ago")), "the newer edit is news");
+        assert!(store.last_injection().unwrap().is_none(), "warnings are not briefings");
     }
 
     #[test]

@@ -628,11 +628,18 @@ fn run(cli: Cli) -> Result<()> {
             let memories = store.count_project(&project)?;
             let events = store.stats(Some(&project))?.events;
             let (messages, peers) = store.mailbox_project_counts(&project)?;
+            let links =
+                store.links()?.into_iter().filter(|(folder, into)| *folder == project || *into == project).count();
             if yes {
                 // Always scrub, even with nothing left to delete: a run that
                 // was blocked by another process finishes here.
                 let forgotten = store.forget_project(&project)?;
-                if forgotten.memories == 0 && forgotten.events == 0 && forgotten.messages == 0 && forgotten.peers == 0 {
+                if forgotten.memories == 0
+                    && forgotten.events == 0
+                    && forgotten.messages == 0
+                    && forgotten.peers == 0
+                    && forgotten.links == 0
+                {
                     println!("Nothing is stored for {project}.");
                 } else {
                     println!(
@@ -645,6 +652,9 @@ fn run(cli: Cli) -> Result<()> {
                             forgotten.messages, forgotten.peers
                         );
                     }
+                    if forgotten.links > 0 {
+                        println!("Removed {} folder link(s) into or out of {project}.", forgotten.links);
+                    }
                 }
                 if !forgotten.scrubbed {
                     println!(
@@ -653,7 +663,7 @@ fn run(cli: Cli) -> Result<()> {
                          to finish scrubbing."
                     );
                 }
-            } else if memories == 0 && events == 0 && messages == 0 && peers == 0 {
+            } else if memories == 0 && events == 0 && messages == 0 && peers == 0 && links == 0 {
                 println!("Nothing is stored for {project}.");
             } else {
                 println!(
@@ -661,6 +671,9 @@ fn run(cli: Cli) -> Result<()> {
                 );
                 if messages > 0 || peers > 0 {
                     println!("Would also delete {messages} messages and {peers} messaging peers.");
+                }
+                if links > 0 {
+                    println!("Would also remove {links} folder link(s) into or out of {project}.");
                 }
             }
         }

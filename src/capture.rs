@@ -346,12 +346,47 @@ pub fn target_files(payload: &Value) -> Vec<String> {
 /// `path` as an absolute forward-slash path, joining a relative one to `base`.
 pub fn absolute(base: &str, path: &str) -> String {
     let path = normalize(path.trim());
-    let abs = if is_absolute(&path) || base.is_empty() {
+    let joined = if is_absolute(&path) || base.is_empty() {
         path
     } else {
         format!("{}/{}", normalize(base).trim_end_matches('/'), path)
     };
-    abs.replace("/./", "/")
+    collapse_dots(&joined)
+}
+
+/// Resolves `.` and `..` segments without touching the filesystem, keeping
+/// the root (`C:`, `//server/share`, `/`) and any leading `..` of a relative path.
+fn collapse_dots(path: &str) -> String {
+    let (root, rest) = if let Some(unc) = path.strip_prefix("//") {
+        let mut parts = unc.splitn(3, '/');
+        let server = parts.next().unwrap_or("");
+        let share = parts.next().unwrap_or("");
+        (format!("//{server}/{share}"), parts.next().unwrap_or(""))
+    } else if path.as_bytes().get(1) == Some(&b':') && path.is_char_boundary(2) {
+        (path[..2].to_string(), &path[2..])
+    } else if let Some(rest) = path.strip_prefix('/') {
+        ("/".to_string(), rest)
+    } else {
+        (String::new(), path)
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in rest.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." if segments.last().is_some_and(|s| *s != "..") => {
+                segments.pop();
+            }
+            ".." if root.is_empty() => segments.push(".."),
+            ".." => {}
+            name => segments.push(name),
+        }
+    }
+    let body = segments.join("/");
+    match root.as_str() {
+        "" => body,
+        "/" => format!("/{body}"),
+        root => format!("{root}/{body}"),
+    }
 }
 
 /// A path relative to the first of `roots` that contains it, with forward
@@ -642,6 +677,16 @@ mod tests {
         assert_eq!(target_files(&codex), ["C:/work/app/sub/x.rs", "C:/work/app/sub/y.rs"]);
         assert!(target_files(&json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } })).is_empty());
         assert!(target_files(&json!({ "tool_name": "Write", "tool_input": {} })).is_empty());
+    }
+
+    #[test]
+    fn absolute_collapses_dot_segments_without_the_filesystem() {
+        assert_eq!(absolute("C:/work/launch", "../app/src/x.rs"), "C:/work/app/src/x.rs");
+        assert_eq!(absolute("C:/work", "./a/./b/../c.rs"), "C:/work/a/c.rs");
+        assert_eq!(absolute("", "//srv/share/repo/../lib/x.rs"), "//srv/share/lib/x.rs");
+        assert_eq!(absolute("", "/home/me/../you/x"), "/home/you/x");
+        assert_eq!(absolute("C:/", "../../x"), "C:/x", "never climbs above the root");
+        assert_eq!(absolute("", "../x"), "../x", "a relative path keeps its leading ..");
     }
 
     #[test]

@@ -303,8 +303,21 @@ fn session_lines(events: &[Event]) -> Vec<Line> {
     // nothing about requests and replies then.
     if let Some(p) = prompt.filter(|p| !p.summary.is_empty()) {
         lines.push(Line::new(format!("  Last request: \"{}\"", clean(&p.summary, 200)), source(p)));
-        // A reply only answers the request if it came after it.
-        match turn_end.filter(|r| r.id > p.id) {
+        // A reply only answers the request if it came after it, and not after
+        // host-injected text (a task notification) that it may be answering.
+        let answering_host = |r: &&Event| {
+            events.iter().any(|e| e.kind == "prompt" && e.agent_id.is_empty() && e.id > p.id && e.id < r.id)
+        };
+        match turn_end.filter(|r| r.id > p.id && !answering_host(r)) {
+            _ if turn_end.is_some_and(|r| r.id > p.id && answering_host(&r)) => {
+                let r = turn_end.expect("checked above");
+                if !r.summary.is_empty() {
+                    lines.push(Line::new(
+                        format!("  Last reply (after a host notification): \"{}\"", clean(&r.summary, 300)),
+                        source(r),
+                    ));
+                }
+            }
             Some(r) if !r.summary.is_empty() => {
                 lines.push(Line::new(format!("  Last reply: \"{}\"", clean(&r.summary, 300)), source(r)));
             }
@@ -515,8 +528,32 @@ fn from_other_folders(store: &Store, req: &BriefRequest) -> Result<Option<Sectio
 /// Text a host put in the prompt stream itself (task notifications, system
 /// reminders, messages from other sessions), not something the user typed.
 pub(crate) fn is_host_text(summary: &str) -> bool {
-    let mut chars = summary.trim_start().chars();
-    chars.next() == Some('<') && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+    const HOST_TAGS: &[&str] = &[
+        "task-notification",
+        "system-reminder",
+        "cross-session-message",
+        "command-name",
+        "command-message",
+        "command-args",
+        "local-command-stdout",
+        "local-command-stderr",
+        "local-command-caveat",
+        "bash-input",
+        "bash-stdout",
+        "bash-stderr",
+        "user-prompt-submit-hook",
+        "ide_opened_file",
+        "ide_selection",
+        "csm_briefing",
+        "turn_aborted",
+        "environment_context",
+        "user_instructions",
+    ];
+    let Some(rest) = summary.trim_start().strip_prefix('<') else {
+        return false;
+    };
+    let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+    HOST_TAGS.contains(&name.as_str()) && rest[name.len()..].starts_with([' ', '>', '/'])
 }
 
 /// A prompt worth quoting as "the last request".
@@ -997,9 +1034,14 @@ mod tests {
         store.record_at(ev("turn_end", "claude", "s1", "Doors open on F."), NOW - 7 * MIN).unwrap();
         let t = build(&store, &req(None)).unwrap().unwrap().text;
         assert!(t.contains("Last request: \"wire up the hangar doors\""), "{t}");
-        assert!(t.contains("Last reply: \"Doors open on F.\""), "{t}");
+        assert!(t.contains("Last reply (after a host notification): \"Doors open on F.\""), "{t}");
         assert!(!t.contains("task-notification") && !t.contains("system-reminder"), "{t}");
         assert!(is_typed_prompt("<3 this works") && !is_host_text("< spaced"));
+        assert!(is_typed_prompt("<button> on the login form is not clickable"), "a real prompt may start with a tag");
+        assert!(
+            is_host_text("<task-notification> <task-id>x</task-id>")
+                && is_host_text("<cross-session-message from=\"x\">")
+        );
     }
 
     #[test]
