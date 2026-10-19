@@ -203,6 +203,19 @@ enum Command {
         #[command(subcommand)]
         action: WakeCommand,
     },
+    /// Count sessions started in FOLDER as part of another project; with no arguments, list links
+    Link {
+        /// The folder sessions start in, e.g. where Claude Code is launched
+        folder: Option<PathBuf>,
+        /// The project those sessions belong to
+        #[arg(long)]
+        into: Option<PathBuf>,
+        /// Move the folder's history and create the link; without this, only show what would move
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Stop counting FOLDER as another project (history already moved stays there)
+    Unlink { folder: PathBuf },
     /// Run the MCP server on stdin/stdout
     Mcp {
         #[arg(long)]
@@ -343,12 +356,13 @@ fn stored_project_key(store: &Store, path: &std::path::Path) -> Result<String> {
     }
 }
 
-fn resolve_project(path: Option<PathBuf>) -> Result<String> {
+/// The project for a folder (default: the current one), following `csm link`.
+fn resolve_project(store: &Store, path: Option<PathBuf>) -> Result<String> {
     let dir = match path {
         Some(p) => p,
         None => std::env::current_dir()?,
     };
-    Ok(project::resolve(&dir))
+    store.canonical_project(&project::resolve(&dir))
 }
 
 fn print_json<T: serde::Serialize>(value: &T) {
@@ -426,7 +440,7 @@ fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Save { content, kind, tags, importance, project } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             let saved = store.save(NewMemory { project, kind, content, tags, importance, source: None })?;
             if saved.duplicate {
                 println!("Already saved as #{}.", saved.memory.id);
@@ -438,7 +452,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Search { query, limit, kind, all, project, json } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             let filter = Filter { project: (!all).then_some(project.as_str()), kind: kind.as_deref(), limit };
             let hits = store.search(&query, filter)?;
             if json {
@@ -450,7 +464,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::List { limit, kind, all, project, json } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             let filter = Filter { project: (!all).then_some(project.as_str()), kind: kind.as_deref(), limit };
             let memories = store.list(filter)?;
             if json {
@@ -468,7 +482,7 @@ fn run(cli: Cli) -> Result<()> {
             println!("Deleted #{id}.");
         }
         Command::Brief { project, budget, explain } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             let request =
                 BriefRequest { project: &project, current_session: None, exclude_active: true, budget, now: now_ms() };
             match brief::build(&store, &request)? {
@@ -485,7 +499,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Journal { limit, kind, session, all, project, json } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             if let Some(k) = kind.as_deref().filter(|k| !EVENT_KINDS.contains(k)) {
                 return Err(Error::Invalid(format!("unknown kind {k}; one of: {}", EVENT_KINDS.join(", "))));
             }
@@ -527,7 +541,7 @@ fn run(cli: Cli) -> Result<()> {
                 eprintln!("Note: the summary and goal are kept to {MAX_HANDOFF_BYTES} bytes each.");
             }
             let result = store.checkpoint(Checkpoint {
-                project: resolve_project(project)?,
+                project: resolve_project(&store, project)?,
                 host: "cli".into(),
                 session_id: None,
                 summary,
@@ -542,7 +556,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Status { project } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             let stats = store.stats(Some(&project))?;
             println!("csm {}", env!("CARGO_PKG_VERSION"));
             println!("database: {}", db.display());
@@ -556,9 +570,55 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(line) = hook::last_failure() {
                 println!("last hook error: {line}");
             }
+            for (other, edits) in store.related_projects(&project)?.into_iter().take(3) {
+                println!("sessions started in {other} edited files here ({edits} edits); `csm link` can make them one project");
+            }
+        }
+        Command::Link { folder, into, yes } => match (folder, into) {
+            (None, None) => {
+                let links = store.links()?;
+                if links.is_empty() {
+                    println!("No linked folders.");
+                }
+                for (folder, project) in links {
+                    println!("{folder} -> {project}");
+                }
+                let here = resolve_project(&store, None)?;
+                for (other, edits) in store.related_projects(&here)?.into_iter().take(5) {
+                    println!("Sessions started in {other} made {edits} edits in {here}. To share one memory:");
+                    println!("  csm link \"{other}\" --into \"{here}\"");
+                }
+            }
+            (Some(folder), Some(into)) => {
+                // The folder's own key, not where it may already be linked.
+                let folder = project::resolve(&folder);
+                let into = resolve_project(&store, Some(into))?;
+                if yes {
+                    let moved = store.link_project(&folder, &into)?;
+                    println!(
+                        "Linked {folder} into {into}: moved {} memories and {} journal events. Sessions started there now count as {into}.",
+                        moved.memories, moved.events
+                    );
+                } else {
+                    let would = store.link_preview(&folder)?;
+                    println!(
+                        "Would link {folder} into {into}, moving {} memories and {} journal events. Re-run with --yes to do it.",
+                        would.memories, would.events
+                    );
+                }
+            }
+            _ => return Err(Error::Invalid("give both FOLDER and --into PROJECT, or neither to list links".into())),
+        },
+        Command::Unlink { folder } => {
+            let folder = project::resolve(&folder);
+            if store.unlink_project(&folder)? {
+                println!("Unlinked {folder}. History already moved stays in the project it was linked into.");
+            } else {
+                println!("{folder} is not linked.");
+            }
         }
         Command::Export { project, all } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             let scope = (!all).then_some(project.as_str());
             let events = store.events(&EventQuery { project: scope, limit: usize::MAX >> 1, ..Default::default() })?;
             print_json(&serde_json::json!({ "memories": store.export(scope)?, "events": events }));
@@ -605,7 +665,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Peers { project, all_projects, include_stale } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             print_json(
                 &serde_json::json!({"peers": store.peers((!all_projects).then_some(project.as_str()), now_ms(), include_stale)?}),
             );
@@ -674,7 +734,7 @@ fn run(cli: Cli) -> Result<()> {
             WakeCommand::CodexCall => unreachable!("handled before opening the store"),
         },
         Command::Mcp { project } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             Server::new(store, project).run_stdio()?;
         }
         Command::Hook { .. } | Command::Setup { .. } => unreachable!("handled before opening the store"),

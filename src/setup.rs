@@ -61,7 +61,11 @@ const CLAUDE_HOOKS: &[HookSpec] = &[
     ("PostToolUseFailure", Some(CLAUDE_TOOLS), 5),
     ("Stop", None, 5),
     ("SessionEnd", None, 2),
+    // Collision warnings before an edit. Last, so adding it never moves the
+    // position of a hook that is already installed (and trusted).
+    ("PreToolUse", Some(CLAUDE_EDIT_TOOLS), 5),
 ];
+const CLAUDE_EDIT_TOOLS: &str = "Edit|MultiEdit|Write|NotebookEdit";
 /// Codex runs every hook through PowerShell (about 200 ms each), so only
 /// the tools csm records trigger one.
 const CODEX_HOOKS: &[HookSpec] = &[
@@ -70,6 +74,7 @@ const CODEX_HOOKS: &[HookSpec] = &[
     ("PostToolUse", Some("^(Bash|apply_patch)$"), 5),
     ("Stop", None, 5),
     ("SessionEnd", None, 2),
+    ("PreToolUse", Some("^apply_patch$"), 5),
 ];
 
 const MCP_NAME: &str = "csm";

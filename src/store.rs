@@ -203,6 +203,7 @@ impl Store {
         store.migrate()?;
         store.init_messaging()?;
         store.init_wake()?;
+        store.init_coordination()?;
         Ok(store)
     }
 
@@ -406,6 +407,8 @@ impl Store {
         let memories = tx.execute("DELETE FROM memories WHERE project = ?1", [project])?;
         let events = tx.execute("DELETE FROM events WHERE project = ?1", [project])?;
         tx.execute("DELETE FROM injections WHERE project = ?1", [project])?;
+        tx.execute("DELETE FROM csm_file_touches WHERE project = ?1", [project])?;
+        tx.execute("DELETE FROM csm_project_links WHERE alias = ?1 OR project = ?1", [project])?;
         // Remove both directions, including explicitly allowed cross-project messages.
         let messages = tx.execute(
             "DELETE FROM csm_messages WHERE from_peer IN (SELECT id FROM csm_peers WHERE project = ?1)

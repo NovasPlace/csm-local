@@ -7,6 +7,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::capture::{absolute, rel_path};
+
 use crate::journal::{Event, EventQuery, SessionInfo, MAX_HANDOFF_BYTES};
 use crate::store::Store;
 use crate::text::{one_line, tail, truncate};
@@ -28,6 +30,8 @@ const MAX_SESSION_FILES: usize = 8;
 const MAX_SESSION_COMMANDS: usize = 4;
 const MAX_MEMORIES: usize = 6;
 const MAX_RECENT: usize = 6;
+const MAX_FOREIGN_SESSIONS: usize = 3;
+const MAX_FOREIGN_FILES: usize = 4;
 
 const INTRO: &str = "Notes recorded by csm during earlier sessions in this project. \
 They can be out of date; the files in the repository are the source of truth.";
@@ -86,6 +90,7 @@ pub fn build(store: &Store, req: &BriefRequest) -> Result<Option<Briefing>> {
     sections.extend(sessions.previous);
     sections.extend(memories(store, req)?);
     sections.extend(recent(store, req, &sessions.shown)?);
+    sections.extend(from_other_folders(store, req)?);
     if sections.iter().all(|s| s.lines.is_empty()) {
         return Ok(None);
     }
@@ -228,7 +233,8 @@ fn previous_session(store: &Store, req: &BriefRequest) -> Result<Sessions> {
     for s in candidates {
         if is_live(&s) {
             let events = session_events(store, req, &s.session_id)?;
-            let request = events.iter().find(|e| e.kind == "prompt" && e.agent_id.is_empty() && !e.summary.is_empty());
+            let request =
+                events.iter().find(|e| e.kind == "prompt" && e.agent_id.is_empty() && is_typed_prompt(&e.summary));
             let line = match request {
                 Some(p) => format!(
                     "  via {}, {}: last request \"{}\"",
@@ -291,7 +297,7 @@ fn session_lines(events: &[Event]) -> Vec<Line> {
     // not the conversation with the user.
     let main = |e: &&Event| e.agent_id.is_empty();
     let mut lines = Vec::new();
-    let prompt = events.iter().filter(main).find(|e| e.kind == "prompt");
+    let prompt = events.iter().filter(main).find(|e| e.kind == "prompt" && !is_host_text(&e.summary));
     let turn_end = events.iter().filter(main).find(|e| e.kind == "turn_end");
     // With text capture off, prompts are recorded without their words; say
     // nothing about requests and replies then.
@@ -417,6 +423,109 @@ fn recent(store: &Store, req: &BriefRequest, shown: &[String]) -> Result<Option<
         title: Some("Other recent changes:".into()),
         lines,
     }))
+}
+
+/// One session started in another folder that edited files here.
+struct ForeignSession {
+    host: String,
+    session_id: String,
+    project: String,
+    /// Its newest edit here.
+    ts: i64,
+    /// Paths relative to this project.
+    files: Vec<String>,
+    source: Option<String>,
+}
+
+/// Edits to this project's files by sessions started somewhere else, e.g.
+/// Claude Code launched in a parent folder. One line per session.
+fn from_other_folders(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
+    let events = store.foreign_edits(req.project, req.now - RECENT_MAX_AGE_MS, 300)?;
+    let roots = [req.project.to_string()];
+    let mut sessions: Vec<ForeignSession> = Vec::new();
+    for e in &events {
+        let Some(session_id) = e.session_id.clone() else {
+            continue;
+        };
+        let here: Vec<String> = e
+            .files
+            .iter()
+            .map(|f| rel_path(&roots, req.project, &absolute(&e.project, f)))
+            .filter(|f| !is_absolute_path(f))
+            .collect();
+        match sessions.iter().position(|s| s.host == e.host && s.session_id == session_id) {
+            Some(i) => {
+                for f in here {
+                    if !sessions[i].files.contains(&f) {
+                        sessions[i].files.push(f);
+                    }
+                }
+            }
+            None if sessions.len() < MAX_FOREIGN_SESSIONS => sessions.push(ForeignSession {
+                host: e.host.clone(),
+                session_id,
+                project: e.project.clone(),
+                ts: e.ts,
+                files: here,
+                source: source(e),
+            }),
+            None => {}
+        }
+    }
+    let mut lines = Vec::new();
+    for s in sessions.into_iter().filter(|s| !s.files.is_empty()) {
+        let folder = s.project.rsplit('/').next().unwrap_or(&s.project).to_string();
+        let shown: Vec<String> = s.files.iter().take(MAX_FOREIGN_FILES).map(|f| clean(f, 100)).collect();
+        let more = s.files.len().saturating_sub(MAX_FOREIGN_FILES);
+        let more = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+        let request = store
+            .events(&EventQuery {
+                project: Some(&s.project),
+                session_id: Some(&s.session_id),
+                kinds: &["prompt"],
+                limit: 20,
+                ..Default::default()
+            })?
+            .into_iter()
+            .find(|p| is_typed_prompt(&p.summary))
+            .map(|p| format!("; last request \"{}\"", clean(&p.summary, 120)))
+            .unwrap_or_default();
+        lines.push(Line::new(
+            format!(
+                "  {} via {}, session in {folder}: {}{more}{request}",
+                ago(req.now, s.ts),
+                s.host,
+                shown.join(", ")
+            ),
+            s.source,
+        ));
+    }
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Section {
+        name: "foreign",
+        priority: 4,
+        protected: false,
+        title: Some("Changes here from sessions started in other folders:".into()),
+        lines,
+    }))
+}
+
+/// Text a host put in the prompt stream itself (task notifications, system
+/// reminders, messages from other sessions), not something the user typed.
+pub(crate) fn is_host_text(summary: &str) -> bool {
+    let mut chars = summary.trim_start().chars();
+    chars.next() == Some('<') && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+}
+
+/// A prompt worth quoting as "the last request".
+pub(crate) fn is_typed_prompt(summary: &str) -> bool {
+    !summary.trim().is_empty() && !is_host_text(summary)
+}
+
+fn is_absolute_path(path: &str) -> bool {
+    path.starts_with('/') || path.as_bytes().get(1) == Some(&b':')
 }
 
 fn render(req: &BriefRequest, mut sections: Vec<Section>, budget: usize) -> Briefing {
@@ -875,6 +984,55 @@ mod tests {
         }
         let t = build(&store, &req(None)).unwrap().unwrap().text;
         assert!(t.contains("Other recent changes:\n  5h ago via codex: Edit README.md"), "{t}");
+    }
+
+    #[test]
+    fn host_injected_prompts_are_not_quoted_as_requests() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_at(ev("prompt", "claude", "s1", "wire up the hangar doors"), NOW - 10 * MIN).unwrap();
+        store
+            .record_at(ev("prompt", "claude", "s1", "<task-notification> <task-id>b1</task-id>"), NOW - 9 * MIN)
+            .unwrap();
+        store.record_at(ev("prompt", "claude", "s1", "<system-reminder> Linked sessions now"), NOW - 8 * MIN).unwrap();
+        store.record_at(ev("turn_end", "claude", "s1", "Doors open on F."), NOW - 7 * MIN).unwrap();
+        let t = build(&store, &req(None)).unwrap().unwrap().text;
+        assert!(t.contains("Last request: \"wire up the hangar doors\""), "{t}");
+        assert!(t.contains("Last reply: \"Doors open on F.\""), "{t}");
+        assert!(!t.contains("task-notification") && !t.contains("system-reminder"), "{t}");
+        assert!(is_typed_prompt("<3 this works") && !is_host_text("< spaced"));
+    }
+
+    #[test]
+    fn shows_edits_from_sessions_started_in_other_folders() {
+        let store = Store::open_in_memory().unwrap();
+        let launch = "C:/work/launcher";
+        let mut prompt = ev("prompt", "claude", "c1", "fix the dropship bay");
+        prompt.project = launch.into();
+        store.record_at(prompt, NOW - 30 * MIN).unwrap();
+        for (i, file) in
+            ["C:/work/app/src/bay.rs", "C:/work/app/src/ship.rs", "C:/work/launcher/notes.md"].iter().enumerate()
+        {
+            let mut e = ev("edit", "claude", "c1", &format!("Edit {file}"));
+            e.project = launch.into();
+            e.files = vec![file.to_string()];
+            store.record_at(e, NOW - (20 - i as i64) * MIN).unwrap();
+        }
+        // A parent-folder session stores paths relative to the parent.
+        let mut parent = ev("edit", "claude", "p1", "Edit app/src/main.rs");
+        parent.project = "C:/work".into();
+        parent.files = vec!["app/src/main.rs".into()];
+        store.record_at(parent, NOW - 5 * MIN).unwrap();
+
+        let t = build(&store, &req(None)).unwrap().unwrap().text;
+        assert!(t.contains("Changes here from sessions started in other folders:"), "{t}");
+        assert!(t.contains("  5m ago via claude, session in work: src/main.rs"), "{t}");
+        assert!(
+            t.contains(
+                "via claude, session in launcher: src/ship.rs, src/bay.rs; last request \"fix the dropship bay\""
+            ),
+            "{t}"
+        );
+        assert!(!t.contains("notes.md"), "files outside this project stay out: {t}");
     }
 
     #[test]

@@ -347,6 +347,49 @@ impl Store {
         )?)
     }
 
+    /// Whether a session looks like it is still running: it has not ended,
+    /// and it did something within `window_ms`.
+    pub fn session_live(&self, project: &str, host: &str, session_id: &str, now: i64, window_ms: i64) -> Result<bool> {
+        let last: Option<i64> = self.conn.query_row(
+            "SELECT MAX(ts) FROM events WHERE project = ?1 AND host = ?2 AND session_id = ?3",
+            params![project, host, session_id],
+            |r| r.get(0),
+        )?;
+        Ok(last.is_some_and(|ts| now - ts <= window_ms) && !self.session_ended(project, host, session_id)?)
+    }
+
+    /// Edits to files inside `project` made by sessions that belong to other
+    /// projects: a session started in a parent folder (its paths are relative
+    /// to that parent) or in an unrelated folder (its paths are absolute).
+    /// Newest first.
+    pub fn foreign_edits(&self, project: &str, since_ts: i64, limit: usize) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events
+             WHERE kind IN ('edit', 'write', 'delete') AND project <> ?1 AND ts >= ?2 AND (ok IS NULL OR ok <> 0)
+               AND (instr(lower(char(10) || files), lower(char(10) || ?1 || '/')) > 0
+                    OR (substr(lower(?1), 1, length(project) + 1) = lower(project) || '/'
+                        AND instr(lower(char(10) || files), char(10) || lower(substr(?1, length(project) + 2)) || '/') > 0))
+             ORDER BY id DESC
+             LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![project, since_ts, limit as i64], row_to_event)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Projects whose sessions edited files inside `project`, with how many
+    /// such edits each made, most first.
+    pub fn related_projects(&self, project: &str) -> Result<Vec<(String, i64)>> {
+        let mut counts: Vec<(String, i64)> = Vec::new();
+        for e in self.foreign_edits(project, 0, 100_000)? {
+            match counts.iter_mut().find(|(p, _)| *p == e.project) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((e.project, 1)),
+            }
+        }
+        counts.sort_by_key(|c| std::cmp::Reverse(c.1));
+        Ok(counts)
+    }
+
     /// Records that a briefing was injected, unless one was already injected
     /// for this session and trigger (within `window_ms`, when given). Returns
     /// whether the caller should inject.

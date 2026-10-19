@@ -108,7 +108,13 @@ impl Server {
     }
 
     fn project_for(&self, args: &Value) -> String {
-        str_arg(args, "project").map(|p| project::resolve(Path::new(p))).unwrap_or_else(|| self.project.clone())
+        str_arg(args, "project").map(|p| self.resolve(p)).unwrap_or_else(|| self.project.clone())
+    }
+
+    /// A project argument as a project key, following `csm link`.
+    fn resolve(&self, path: &str) -> String {
+        let key = project::resolve(Path::new(path));
+        self.store.canonical_project(&key).unwrap_or(key)
     }
 
     fn connected_peer(&self) -> Result<Peer> {
@@ -154,7 +160,7 @@ impl Server {
             Some(_) => self.connected_peer()?.project,
             None => self.project.clone(),
         };
-        let project = str_arg(args, "project").map(|p| project::resolve(Path::new(p))).unwrap_or(default_project);
+        let project = str_arg(args, "project").map(|p| self.resolve(p)).unwrap_or(default_project);
         let include_stale = args.get("include_stale").and_then(Value::as_bool).unwrap_or(false);
         Ok(json!({"peers": self.store.peers((!all).then_some(project.as_str()), now_ms(), include_stale)?}).to_string())
     }

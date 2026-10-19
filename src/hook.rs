@@ -15,14 +15,14 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::brief::{self, BriefRequest};
-use crate::capture::tool_event;
 pub use crate::capture::Host;
+use crate::capture::{target_files, tool_event};
 use crate::journal::NewEvent;
 use crate::redact::redact;
 use crate::store::{content_hash, Store};
 use crate::text::{one_line, truncate};
 use crate::time::{iso, now_ms};
-use crate::{paths, project, Error, Result};
+use crate::{leases, paths, project, Error, Result};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_PROMPT_BYTES: usize = 300;
@@ -197,7 +197,10 @@ fn messaging_context(store: &Store, host: Host, payload: &Value, env: &HookEnv) 
     };
     let id = format!("{}:{session}", host.name());
     // The inbox belongs to the session, even if a host changes its cwd mid-turn.
-    let home_project = store.peer(&id)?.map(|p| p.project).unwrap_or_else(|| project::resolve(Path::new(dir)));
+    let home_project = match store.peer(&id)? {
+        Some(peer) => peer.project,
+        None => project_key(store, dir),
+    };
     let peer = store.register_peer(&home_project, host.name(), session, None, state, env.now)?;
     if host == Host::Codex && event != "SessionEnd" && store.wake_enabled()? {
         if let Some(pipe) = &env.codex_app_pipe {
@@ -269,7 +272,7 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
     let Some(dir) = dir else {
         return Ok(None);
     };
-    let project = project::resolve(Path::new(dir));
+    let project = project_key(store, dir);
     let agent_id = field("agent_id").unwrap_or("").to_string();
     let base = NewEvent {
         project: project.clone(),
@@ -309,6 +312,7 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             let out = session_start_context(store, host, &project, session_id, source, env)?;
             if recorded.is_ok() {
                 let _ = store.prune_events(&project, env.now);
+                let _ = store.prune_touches(env.now);
             }
             Ok(out)
         }
@@ -326,6 +330,7 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             let mut roots = vec![project.clone()];
             roots.extend(project::root_aliases(Path::new(dir)).into_iter().filter(|a| *a != project));
             if let Some(t) = tool_event(host, payload, &roots, event_name == "PostToolUseFailure") {
+                let edited = matches!(t.kind, "edit" | "write" | "delete") && t.ok != Some(false);
                 let tool = NewEvent {
                     kind: t.kind.into(),
                     tool: Some(t.tool),
@@ -336,9 +341,26 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
                     dedup_key: field("tool_use_id").map(|id| format!("tool:{id}")),
                     ..base
                 };
-                store.record_at(tool, env.now)?;
+                let recorded = store.record_at(tool, env.now)?;
+                if edited && recorded.is_some() {
+                    let paths = target_files(payload);
+                    store.touch_files(&project, host.name(), session_id, &agent_id, &paths, env.now)?;
+                }
             }
             Ok(None)
+        }
+        // Before an edit: say so if another running session just edited the
+        // same file. Advisory only; the edit goes ahead either way.
+        "PreToolUse" => {
+            let paths = target_files(payload);
+            if paths.is_empty() {
+                return Ok(None);
+            }
+            let notice = leases::collision_notice(store, host, session_id, &agent_id, &project, &paths, env.now)?;
+            Ok(notice.map(|text| {
+                json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": text } })
+                    .to_string()
+            }))
         }
         // csm never blocks a Stop, so `stop_hook_active` (another hook made
         // the turn continue) is just one more reply, and the latest wins.
@@ -442,6 +464,12 @@ fn session_start_context(
     Ok(Some(out.to_string()))
 }
 
+/// The project a hook's folder belongs to, following `csm link`.
+fn project_key(store: &Store, dir: &str) -> String {
+    let key = project::resolve(Path::new(dir));
+    store.canonical_project(&key).unwrap_or(key)
+}
+
 /// Set when `--db` points somewhere else, so the log sits next to that
 /// database instead of in the default data directory.
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -503,6 +531,80 @@ mod tests {
 
     fn events(store: &Store) -> Vec<crate::journal::Event> {
         store.events(&EventQuery { limit: 100, ..Default::default() }).unwrap()
+    }
+
+    fn edit(session: &str, host_tool: &str, event: &str, file: &str) -> Value {
+        let input = if host_tool == "apply_patch" {
+            json!({ "command": format!("*** Begin Patch
+*** Update File: {file}
+@@
+-a
++b
+*** End Patch") })
+        } else {
+            json!({ "file_path": format!("{DIR}/{file}") })
+        };
+        json!({ "hook_event_name": event, "session_id": session, "cwd": DIR, "tool_name": host_tool,
+                "tool_use_id": format!("{session}-{host_tool}-{event}-{file}"), "tool_input": input, "tool_response": {} })
+    }
+
+    #[test]
+    fn warns_before_editing_a_file_another_running_session_just_edited() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = 1_791_900_000_000;
+        let prompt = json!({ "hook_event_name": "UserPromptSubmit", "session_id": "codex-1", "cwd": DIR,
+                             "turn_id": "t1", "prompt": "rework the router" });
+        send(&store, Host::Codex, prompt, t0);
+        send(&store, Host::Codex, edit("codex-1", "apply_patch", "PostToolUse", "src/router.rs"), t0 + 1_000);
+
+        // Claude is about to edit the same file two minutes later.
+        let out = send(&store, Host::Claude, edit("claude-1", "Edit", "PreToolUse", "src/router.rs"), t0 + 120_000)
+            .expect("a collision warning");
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        let text = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(text.starts_with("csm: src/router.rs was edited 1m ago by another session that is still running (via codex in app, last request: \"rework the router\")."), "{text}");
+        for key in ["permissionDecision", "decision", "continue"] {
+            assert!(!out.contains(key), "{key} in {out}");
+        }
+        // Said once; the same edit again stays quiet. Another file is fine.
+        assert!(
+            send(&store, Host::Claude, edit("claude-1", "Edit", "PreToolUse", "src/router.rs"), t0 + 130_000).is_none()
+        );
+        assert!(
+            send(&store, Host::Claude, edit("claude-1", "Edit", "PreToolUse", "src/other.rs"), t0 + 130_000).is_none()
+        );
+        // The warning itself records nothing in the journal.
+        assert_eq!(events(&store).len(), 2);
+    }
+
+    #[test]
+    fn only_successful_edits_count_as_touches() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = 1_791_900_000_000;
+        send(
+            &store,
+            Host::Claude,
+            json!({ "hook_event_name": "UserPromptSubmit", "session_id": "a", "cwd": DIR, "prompt": "x" }),
+            t0,
+        );
+        let mut failed = edit("a", "Edit", "PostToolUseFailure", "src/x.rs");
+        failed["error"] = json!("EPERM: file is locked");
+        send(&store, Host::Claude, failed, t0 + 1);
+        assert!(send(&store, Host::Codex, edit("b", "apply_patch", "PreToolUse", "src/x.rs"), t0 + 60_000).is_none());
+        send(&store, Host::Claude, edit("a", "Write", "PostToolUse", "src/x.rs"), t0 + 2);
+        assert!(send(&store, Host::Codex, edit("b", "apply_patch", "PreToolUse", "src/x.rs"), t0 + 60_000).is_some());
+    }
+
+    #[test]
+    fn sessions_in_a_linked_folder_count_as_the_linked_project() {
+        let store = Store::open_in_memory().unwrap();
+        let launch = "C:/work/launcher";
+        store.link_project(&project::resolve(Path::new(launch)), &project()).unwrap();
+        let prompt =
+            json!({ "hook_event_name": "UserPromptSubmit", "session_id": "c1", "cwd": launch, "prompt": "hi" });
+        send(&store, Host::Claude, prompt, 1);
+        assert_eq!(events(&store)[0].project, project());
     }
 
     /// A Claude session that edits a file and fails a test, then ends.

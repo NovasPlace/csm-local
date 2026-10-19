@@ -7,6 +7,8 @@ pub mod brief;
 pub mod capture;
 pub mod hook;
 pub mod journal;
+pub mod leases;
+pub mod links;
 pub mod mcp;
 pub mod messaging;
 pub mod paths;

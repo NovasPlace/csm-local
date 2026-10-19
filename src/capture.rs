@@ -312,12 +312,52 @@ fn patch_files(patch: &str) -> Vec<(PatchOp, String)> {
     out
 }
 
+/// The files an edit tool is about to change or just changed, as absolute
+/// forward-slash paths. Empty for every other tool.
+pub fn target_files(payload: &Value) -> Vec<String> {
+    let Some(tool) = payload.get("tool_name").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let input = payload.get("tool_input").unwrap_or(&Value::Null);
+    let cwd = payload.get("cwd").and_then(Value::as_str).unwrap_or("");
+    let named = |key: &str| input.get(key).and_then(Value::as_str).map(|p| vec![p.to_string()]).unwrap_or_default();
+    let paths = match tool {
+        "Edit" | "MultiEdit" | "Write" => named("file_path"),
+        "NotebookEdit" => named("notebook_path"),
+        "apply_patch" => {
+            let patch = match input {
+                Value::String(s) => Some(s.as_str()),
+                _ => ["command", "patch", "input"].iter().find_map(|k| input.get(*k)?.as_str()),
+            };
+            patch.map(|p| patch_files(p).into_iter().map(|(_, f)| f).collect()).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for path in paths.iter().filter(|p| !p.trim().is_empty()) {
+        let abs = absolute(cwd, path);
+        if !out.contains(&abs) {
+            out.push(abs);
+        }
+    }
+    out
+}
+
+/// `path` as an absolute forward-slash path, joining a relative one to `base`.
+pub fn absolute(base: &str, path: &str) -> String {
+    let path = normalize(path.trim());
+    let abs = if is_absolute(&path) || base.is_empty() {
+        path
+    } else {
+        format!("{}/{}", normalize(base).trim_end_matches('/'), path)
+    };
+    abs.replace("/./", "/")
+}
+
 /// A path relative to the first of `roots` that contains it, with forward
 /// slashes, or the normalized absolute path when it lies outside them all.
 pub fn rel_path(roots: &[String], cwd: &str, path: &str) -> String {
-    let path = normalize(path.trim());
-    let abs = if is_absolute(&path) { path } else { format!("{}/{}", normalize(cwd).trim_end_matches('/'), path) };
-    let abs = abs.replace("/./", "/");
+    let abs = absolute(cwd, path);
     for root in roots {
         let root = format!("{}/", normalize(root).trim_end_matches('/'));
         let matches = if cfg!(windows) {
@@ -589,6 +629,19 @@ mod tests {
         assert!(event(Host::Claude, &claude("Edit", json!({})), false).is_none());
         assert!(event(Host::Claude, &claude("Bash", json!({ "command": "   " })), false).is_none());
         assert!(event(Host::Claude, &json!({}), false).is_none());
+    }
+
+    #[test]
+    fn target_files_name_what_an_edit_tool_will_change() {
+        let claude = json!({ "tool_name": "Edit", "cwd": "C:/work/app", "tool_input": { "file_path": r"C:\work\app\src\a.rs" } });
+        assert_eq!(target_files(&claude), ["C:/work/app/src/a.rs"]);
+        let codex = json!({ "tool_name": "apply_patch", "cwd": "C:/work/app/sub",
+                            "tool_input": { "command": "*** Update File: x.rs
+*** Add File: ./y.rs
+*** Update File: x.rs" } });
+        assert_eq!(target_files(&codex), ["C:/work/app/sub/x.rs", "C:/work/app/sub/y.rs"]);
+        assert!(target_files(&json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } })).is_empty());
+        assert!(target_files(&json!({ "tool_name": "Write", "tool_input": {} })).is_empty());
     }
 
     #[test]
