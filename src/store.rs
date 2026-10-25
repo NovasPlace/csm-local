@@ -149,6 +149,8 @@ pub struct Forgotten {
     pub peers: usize,
     /// Folder links into or out of the project (`csm link`).
     pub links: usize,
+    /// Decision board entries, withdrawals included.
+    pub decisions: usize,
     /// False when another csm process kept the write-ahead log busy, so
     /// copies of the deleted text may remain in it until that process exits.
     pub scrubbed: bool,
@@ -206,6 +208,8 @@ impl Store {
         store.init_messaging()?;
         store.init_wake()?;
         store.init_coordination()?;
+        store.init_decisions()?;
+        store.init_claims()?;
         Ok(store)
     }
 
@@ -392,10 +396,11 @@ impl Store {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM memories WHERE project = ?1", [project], |r| r.get(0))?)
     }
 
-    /// Every project key that has stored memories, events or messaging peers.
+    /// Every project key that has stored memories, events, messaging peers or decisions.
     pub fn project_keys(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT project FROM memories UNION SELECT project FROM events UNION SELECT project FROM csm_peers ORDER BY 1",
+            "SELECT project FROM memories UNION SELECT project FROM events UNION SELECT project FROM csm_peers
+             UNION SELECT project FROM csm_decisions ORDER BY 1",
         )?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -411,6 +416,13 @@ impl Store {
         tx.execute("DELETE FROM injections WHERE project = ?1", [project])?;
         tx.execute("DELETE FROM csm_file_touches WHERE project = ?1", [project])?;
         let links = tx.execute("DELETE FROM csm_project_links WHERE alias = ?1 OR project = ?1", [project])?;
+        let decisions = tx.execute("DELETE FROM csm_decisions WHERE project = ?1", [project])?;
+        tx.execute("DELETE FROM csm_decisions_seen WHERE project = ?1", [project])?;
+        // Claims by this project's sessions, and other sessions' claims on its files.
+        tx.execute(
+            "DELETE FROM csm_file_claims WHERE project = ?1 OR substr(path, 1, length(?2)) = ?2",
+            params![project, format!("{}/", crate::leases::touch_key(project))],
+        )?;
         // Remove both directions, including explicitly allowed cross-project messages.
         let messages = tx.execute(
             "DELETE FROM csm_messages WHERE from_peer IN (SELECT id FROM csm_peers WHERE project = ?1)
@@ -421,7 +433,7 @@ impl Store {
         tx.commit()?;
         self.conn.execute_batch("INSERT INTO memories_fts (memories_fts) VALUES ('optimize'); VACUUM;")?;
         let scrubbed = self.flush_wal()?;
-        Ok(Forgotten { memories, events, messages, peers, links, scrubbed })
+        Ok(Forgotten { memories, events, messages, peers, links, decisions, scrubbed })
     }
 
     /// Copies the write-ahead log into the database and truncates it, so
@@ -674,7 +686,7 @@ mod tests {
         store.save(new(OTHER, "note", "alpha elsewhere")).unwrap();
         assert_eq!(
             store.forget_project(P).unwrap(),
-            Forgotten { memories: 2, events: 0, messages: 0, peers: 0, links: 0, scrubbed: true }
+            Forgotten { memories: 2, events: 0, messages: 0, peers: 0, links: 0, decisions: 0, scrubbed: true }
         );
         let stats = store.stats(Some(P)).unwrap();
         assert_eq!((stats.memories, stats.projects, stats.project_memories), (1, 1, Some(0)));

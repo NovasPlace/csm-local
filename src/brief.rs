@@ -13,7 +13,7 @@ use crate::journal::{Event, EventQuery, SessionInfo, MAX_HANDOFF_BYTES};
 use crate::store::Store;
 use crate::text::{one_line, tail, truncate};
 use crate::time::{ago, iso};
-use crate::Result;
+use crate::{decisions, Result};
 
 pub const DEFAULT_BUDGET: usize = 4_000;
 pub const MIN_BUDGET: usize = 1_000;
@@ -32,6 +32,7 @@ const MAX_MEMORIES: usize = 6;
 const MAX_RECENT: usize = 6;
 const MAX_FOREIGN_SESSIONS: usize = 3;
 const MAX_FOREIGN_FILES: usize = 4;
+const MAX_CLAIMS: usize = 6;
 
 const INTRO: &str = "Notes recorded by csm during earlier sessions in this project. \
 They can be out of date; the files in the repository are the source of truth.";
@@ -83,10 +84,12 @@ pub fn build(store: &Store, req: &BriefRequest) -> Result<Option<Briefing>> {
     let budget = req.budget.clamp(MIN_BUDGET, MAX_BUDGET);
     let mut sections = Vec::new();
     sections.extend(goal(store, req)?);
+    sections.extend(board(store, req)?);
     sections.extend(checkpoint(store, req)?);
     sections.extend(problem(store, req)?);
     let sessions = previous_session(store, req)?;
     sections.extend(sessions.live);
+    sections.extend(claims(store, req)?);
     sections.extend(sessions.previous);
     sections.extend(memories(store, req)?);
     sections.extend(recent(store, req, &sessions.shown)?);
@@ -122,6 +125,70 @@ fn goal(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
             format!("Goal (set {} via {}): {}", ago(req.now, g.ts), g.host, clean(&g.summary, MAX_HANDOFF_BYTES)),
             source(&g),
         )],
+    }))
+}
+
+/// The decision board. Protected like the goal: a session that misses a
+/// standing decision redoes the work the decision was meant to save.
+fn board(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
+    let board = store.decisions(req.project)?;
+    if board.is_empty() {
+        return Ok(None);
+    }
+    let mut lines: Vec<Line> = board
+        .iter()
+        .take(decisions::MAX_SHOWN)
+        .map(|d| {
+            // Room for the whole decision plus its "(2h ago, recorded via ...)".
+            let line = clean(&d.line(req.now), decisions::MAX_DECISION_BYTES + 120);
+            Line::new(format!("  {line}"), Some(format!("decision:{}", d.id)))
+        })
+        .collect();
+    if board.len() > decisions::MAX_SHOWN {
+        lines.push(Line::new(
+            format!("  (+{} more; csm_decisions lists them all)", board.len() - decisions::MAX_SHOWN),
+            None,
+        ));
+    }
+    Ok(Some(Section {
+        name: "decisions",
+        priority: 0,
+        protected: true,
+        title: Some("Standing decisions the user made for this project:".into()),
+        lines,
+    }))
+}
+
+/// Files claimed right now by sessions other than the caller.
+fn claims(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
+    let own = req.current_session.map(|s| format!(":{s}"));
+    let roots = [req.project.to_string()];
+    let lines: Vec<Line> = store
+        .active_claims(req.now)?
+        .into_iter()
+        .filter(|c| !own.as_ref().is_some_and(|own| c.peer.ends_with(own.as_str())))
+        .filter(|c| c.project == req.project || !is_absolute_path(&rel_path(&roots, req.project, &c.path)))
+        .take(MAX_CLAIMS)
+        .map(|c| {
+            let note = if c.note.is_empty() { String::new() } else { format!(": {}", clean(&c.note, 100)) };
+            let line = format!(
+                "  {} by {} {}{note}",
+                clean(&c.file_in(req.project), 100),
+                decisions::recorder(&c.peer),
+                c.remaining(req.now)
+            );
+            Line::new(line, None)
+        })
+        .collect();
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Section {
+        name: "claims",
+        priority: 1,
+        protected: false,
+        title: Some("Files claimed by running sessions (csm_peers shows how to reach them):".into()),
+        lines,
     }))
 }
 

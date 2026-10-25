@@ -314,10 +314,11 @@ def verify_runtime(exe, base, skill, version, verify):
     replies = csm("packaged_mcp_stdio", "mcp", "--project", str(project), binary=installed, input_bytes=wire)
     messages = {item["id"]: item for item in map(json.loads, replies.splitlines())}
     expected_tools = {"csm_save", "csm_search", "csm_list", "csm_delete", "csm_status", "csm_brief", "csm_checkpoint",
-                      "csm_connect", "csm_peers", "csm_send", "csm_inbox", "csm_ack", "csm_message_status", "csm_wait"}
+                      "csm_connect", "csm_peers", "csm_send", "csm_inbox", "csm_ack", "csm_message_status", "csm_wait",
+                      "csm_decide", "csm_decisions", "csm_claim", "csm_release"}
     verify.check("mcp_initialize_succeeds", messages[1]["result"]["serverInfo"]["version"] == version)
-    verify.check("mcp_exposes_exactly_fourteen_tools", {tool["name"] for tool in messages[2]["result"]["tools"]} == expected_tools
-                 and len(messages[2]["result"]["tools"]) == 14)
+    verify.check("mcp_exposes_exactly_eighteen_tools", {tool["name"] for tool in messages[2]["result"]["tools"]} == expected_tools
+                 and len(messages[2]["result"]["tools"]) == 18)
     result = messages[3]["result"]
     verify.check("mcp_recalls_unicode_checkpoint", not result.get("isError") and checkpoint in result["content"][0]["text"])
 

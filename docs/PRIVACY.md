@@ -59,7 +59,7 @@ $project = (Get-Location).Path
 ```
 
 Export is JSON for inspection and portability; this release has no import command.
-It includes memories and journal records, not mailbox tables. Use `peers`,
+It includes memories, journal records and decision board entries, not mailbox tables. Use `peers`,
 `inbox`, and `message-status` to inspect messaging. A database backup includes all
 tables, including retained message history.
 For a restorable database backup, stop agents and CSM processes and copy the data
@@ -75,8 +75,9 @@ directory as described in the recovery guide, or use a SQLite-aware backup tool.
 & $csm forget --project $project --yes
 ```
 
-This removes saved memories, checkpoints, journal events, messaging peers, and
-messages to or from that project in the selected database. Use version 0.2 or
+This removes saved memories, checkpoints, journal events, standing decisions,
+file claims, messaging peers, and messages to or from that project in the
+selected database. Use version 0.2 or
 later to include mailbox data. It does not erase exports, filesystem backups, agent
 transcripts or information already sent to a model provider. If CSM reports that
 database scrubbing was incomplete because another connection is busy, close the

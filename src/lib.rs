@@ -5,6 +5,8 @@
 
 pub mod brief;
 pub mod capture;
+pub mod claims;
+pub mod decisions;
 pub mod hook;
 pub mod journal;
 pub mod leases;

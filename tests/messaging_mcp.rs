@@ -199,7 +199,7 @@ fn two_stdio_mcp_processes_coordinate_over_one_temporary_database() {
     let init = codex.request("initialize", json!({"protocolVersion":"2025-06-18"}));
     assert!(init["instructions"].as_str().unwrap().contains("not human permission"));
     let schema = codex.request("tools/list", json!({}));
-    assert_eq!(schema["tools"].as_array().unwrap().len(), 14);
+    assert_eq!(schema["tools"].as_array().unwrap().len(), 18);
     codex.tool("csm_connect", json!({"host":"codex","session_id":"a","binding_token":codex_token}));
     claude.tool("csm_connect", json!({"host":"claude","session_id":"b","binding_token":claude_token}));
     let sent = codex
@@ -212,4 +212,22 @@ fn two_stdio_mcp_processes_coordinate_over_one_temporary_database() {
     assert_eq!(codex.tool("csm_message_status", json!({"id":id}))["status"], "acknowledged");
     let reply = claude.tool("csm_send", json!({"to":"codex:a","content":"Landing inspected; feet stay above the deck.","request_id":"wire-reply","reply_to":id}));
     assert_eq!(codex.tool("csm_inbox", json!({}))["messages"][0]["id"], reply["message"]["id"]);
+
+    // A claim made in one process shows up in the other's peer listing.
+    let file = format!("{PROJECT}/scripts/landing.gd");
+    let claimed = claude.tool("csm_claim", json!({"files":[file],"minutes":15}));
+    assert_eq!(claimed["claimed"][0]["file"], "scripts/landing.gd");
+    let held = codex.tool("csm_claim", json!({"files":[file]}));
+    assert_eq!(held["held_by_others"][0]["peer"], "claude:b");
+    let peers = codex.tool("csm_peers", json!({}));
+    let holder = peers["peers"].as_array().unwrap().iter().find(|p| p["id"] == "claude:b").unwrap().clone();
+    assert_eq!(holder["claims"][0]["minutes_left"], 15);
+    let relative =
+        codex.request("tools/call", json!({"name":"csm_claim","arguments":{"files":["scripts/landing.gd"]}}));
+    assert_eq!(relative["isError"], true, "a relative path could mean another checkout's file");
+    for files in [json!([""]), json!([])] {
+        let result = claude.request("tools/call", json!({"name":"csm_release","arguments":{"files":files}}));
+        assert_eq!(result["isError"], true, "{files} never means every claim");
+    }
+    assert_eq!(claude.tool("csm_release", json!({}))["released"], 1);
 }

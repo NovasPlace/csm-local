@@ -63,9 +63,30 @@ switch to another identity. The token is absent from peer discovery and messages
 
 Messages from a different project require an explicit `allow_cross_project`
 send. This is useful where the same logical project uses separate folder keys.
-There is no broadcast, automatic task assignment, or automatic reply loop.
+Messages have no broadcast, automatic task assignment, or automatic reply loop;
+the decision board below is the one thing every session hears.
 Peer messages remain agent-authored data and cannot supply human approval or
 override a session's instructions. Acknowledgment is receipt, not agreement.
+
+## Standing decisions and file claims
+
+Some things every session in a project should know, not just the one the user
+said them to. `csm_decide` (or `csm decide "..."`) puts a standing decision the
+user made, such as "saves don't matter: those real-game runs are deliberate",
+on the project's board. Every session sees the board in its briefing at session
+start, and a session that is already running is told on its next prompt or
+tool call after the board changes, once per change. `csm_decide` with
+`withdraw` takes one back or replaces it; `csm_decisions` lists the board. The
+board works without messaging. Agents should record only what the user said or
+confirmed; entries are context for the work, not permission.
+
+After `csm_connect`, `csm_claim` marks files (absolute paths) a session is
+about to change, for 1 to 240 minutes (default 30). Claims appear on their holder in `csm_peers`,
+in other sessions' briefings, and as a warning just before another session
+edits a claimed file. A file another session holds is not claimed; its holder
+is reported instead. Claims are advisory: nothing is locked. They end with
+`csm_release`, at expiry, or when the holding session ends. A quiet session
+that still holds claims stays listed in `csm_peers` as stale.
 
 ## Storage and limits
 

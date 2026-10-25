@@ -95,8 +95,16 @@ impl Store {
                 params![id, project, new_files.join("\n"), rebase_summary(summary, &renamed)],
             )?;
         }
-        for table in ["injections", "csm_file_touches", "csm_peers"] {
+        for table in ["injections", "csm_file_touches", "csm_peers", "csm_file_claims"] {
             tx.execute(&format!("UPDATE {table} SET project = ?2 WHERE project = ?1"), params![folder, project])?;
+        }
+        let decisions =
+            tx.execute("UPDATE csm_decisions SET project = ?2 WHERE project = ?1", params![folder, project])?;
+        // Moved decisions keep their older ids, below what sessions in the
+        // project have seen: those sessions hear the merged board again.
+        tx.execute("DELETE FROM csm_decisions_seen WHERE project = ?1", [folder])?;
+        if decisions > 0 {
+            tx.execute("DELETE FROM csm_decisions_seen WHERE project = ?1", [&project])?;
         }
         // Links that pointed at the folder now point where it went.
         tx.execute("UPDATE csm_project_links SET project = ?2 WHERE project = ?1", params![folder, project])?;

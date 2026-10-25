@@ -12,7 +12,7 @@ use crate::journal::EventQuery;
 use crate::store::{content_hash, Store};
 use crate::text::{one_line, truncate};
 use crate::time::ago;
-use crate::Result;
+use crate::{claims, Result};
 
 /// Another session's edit counts as "recent" for this long, and a session
 /// that has been quiet for this long no longer counts as running.
@@ -131,9 +131,10 @@ CREATE TABLE IF NOT EXISTS csm_project_links (
     }
 }
 
-/// The warning for a session about to edit `paths`, if another running
-/// session edited any of them within the lease window. Each (file, other
-/// session) pair is reported once per window, so repeated edits stay quiet.
+/// The warning for a session about to edit `paths`, if another session has
+/// claimed any of them, or another running session edited any of them
+/// within the lease window. Each claim, and each (file, other session) edit,
+/// is reported once, so repeated edits stay quiet.
 pub fn collision_notice(
     store: &Store,
     host: Host,
@@ -143,8 +144,23 @@ pub fn collision_notice(
     paths: &[String],
     now: i64,
 ) -> Result<Option<String>> {
-    let mut lines = Vec::new();
+    let mut claimed = Vec::new();
     let mut sources = Vec::new();
+    for claim in store.claims_on(paths, &format!("{}:{session_id}", host.name()), now)? {
+        if claimed.len() == MAX_FILES_NAMED {
+            break;
+        }
+        let file = rel_path(&[project.to_string()], project, &claim.path);
+        let note = if claim.note.is_empty() { String::new() } else { format!(": \"{}\"", truncate(&claim.note, 120)) };
+        let line =
+            format!("{file} is claimed by {} {}{note}.", claims::holder(store, &claim.peer)?, claim.remaining(now));
+        let trigger = format!("lease:claim:{}", claim.id);
+        if store.claim_injection(project, host.name(), session_id, agent_id, &trigger, None, &line, &[], now)? {
+            sources.push(claim.peer.clone());
+            claimed.push(line);
+        }
+    }
+    let mut lines = Vec::new();
     for touch in store.recent_touches(paths, host.name(), session_id, now - LEASE_WINDOW_MS)? {
         if lines.len() == MAX_FILES_NAMED {
             break;
@@ -174,12 +190,21 @@ pub fn collision_notice(
             lines.push(line);
         }
     }
-    if lines.is_empty() {
+    if claimed.is_empty() && lines.is_empty() {
         return Ok(None);
     }
-    let mut text = format!("csm: {} Those changes may not be in the copy of the file you read.", lines.join(" "));
+    let mut parts = claimed;
+    if !lines.is_empty() {
+        parts.push(format!("{} Those changes may not be in the copy of the file you read.", lines.join(" ")));
+    }
+    let mut text = format!("csm: {}", parts.join(" "));
     // Messaging peers can be told directly; say so only when they are reachable.
-    let reachable: Vec<String> = sources.iter().filter(|id| store.peer(id).ok().flatten().is_some()).cloned().collect();
+    let mut reachable: Vec<String> = Vec::new();
+    for id in sources {
+        if !reachable.contains(&id) && store.peer(&id).ok().flatten().is_some() {
+            reachable.push(id);
+        }
+    }
     if !reachable.is_empty() {
         text.push_str(&format!(" csm_send reaches that session at {}.", reachable.join(", ")));
     }

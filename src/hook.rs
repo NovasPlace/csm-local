@@ -22,7 +22,7 @@ use crate::redact::redact;
 use crate::store::{content_hash, Store};
 use crate::text::{one_line, truncate};
 use crate::time::{iso, now_ms};
-use crate::{leases, paths, project, Error, Result};
+use crate::{decisions, leases, paths, project, Error, Result};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_PROMPT_BYTES: usize = 300;
@@ -313,6 +313,8 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             if recorded.is_ok() {
                 let _ = store.prune_events(&project, env.now);
                 let _ = store.prune_touches(env.now);
+                let _ = store.prune_claims(env.now);
+                let _ = store.prune_decisions_seen(env.now);
             }
             Ok(out)
         }
@@ -324,7 +326,7 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             if let Some(dedup_key) = turn_key(store, host, session_id, &agent_id, "prompt", turn, field("prompt"))? {
                 store.record_at(NewEvent { kind: "prompt".into(), summary, dedup_key, ..base }, env.now)?;
             }
-            Ok(None)
+            board_context(store, host, session_id, &agent_id, &project, event_name, env)
         }
         "PostToolUse" | "PostToolUseFailure" => {
             let mut roots = vec![project.clone()];
@@ -351,7 +353,10 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
                     store.touch_files(&project, host.name(), session_id, &agent_id, &paths, env.now)?;
                 }
             }
-            Ok(None)
+            if event_name == "PostToolUseFailure" {
+                return Ok(None);
+            }
+            board_context(store, host, session_id, &agent_id, &project, event_name, env)
         }
         // Before an edit: say so if another running session just edited the
         // same file. Advisory only; the edit goes ahead either way.
@@ -389,6 +394,9 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             // No dedup key: a session resumed under the same id ends again.
             let end = NewEvent { kind: "session_end".into(), summary: field("reason").unwrap_or("end").into(), ..base };
             store.record_at(end, env.now)?;
+            if agent_id.is_empty() {
+                store.release_claims(&format!("{}:{session_id}", host.name()), None)?;
+            }
             Ok(None)
         }
         _ => Ok(None),
@@ -438,6 +446,8 @@ fn session_start_context(
         budget: env.budget,
         now: env.now,
     };
+    // Read before building, so a decision added meanwhile is announced later.
+    let board = store.latest_decision(project)?;
     let Some(briefing) = brief::build(store, &request)? else {
         return Ok(None);
     };
@@ -462,10 +472,39 @@ fn session_start_context(
     if !claimed {
         return Ok(None);
     }
+    // A fresh context now knows the whole board, unless trimming cut some of
+    // it. A resumed or compacted one may still hold decisions withdrawn since,
+    // and the board lists only what stands, so its next prompt hears the changes.
+    let fresh = window.is_none();
+    if fresh && !briefing.trimmed.iter().any(|t| t.starts_with("decisions:") || t == "hard_cut") {
+        if let Err(e) = store.advance_decisions_seen(host.name(), session_id, project, board, env.now) {
+            log_failure(host.name(), &e.to_string());
+        }
+    }
     let out = json!({
         "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": briefing.text }
     });
     Ok(Some(out.to_string()))
+}
+
+/// Tells a running session about changes to the decision board since it last
+/// saw it. Subagents are left out; they work for a parent that is told.
+fn board_context(
+    store: &Store,
+    host: Host,
+    session_id: &str,
+    agent_id: &str,
+    project: &str,
+    event_name: &str,
+    env: &HookEnv,
+) -> Result<Option<String>> {
+    if !agent_id.is_empty() {
+        return Ok(None);
+    }
+    let notice = decisions::board_notice(store, host.name(), session_id, project, env.now)?;
+    Ok(notice.map(|text| {
+        json!({ "hookSpecificOutput": { "hookEventName": event_name, "additionalContext": text } }).to_string()
+    }))
 }
 
 /// The project a hook's folder belongs to, following `csm link`.
@@ -702,6 +741,32 @@ mod tests {
         assert!(context.contains("Files changed: src/parser.rs"));
         assert!(context.contains("Last recorded failure (1h ago, via claude): cargo test"));
         assert!(context.contains("test parse_unicode ... FAILED"));
+    }
+
+    #[test]
+    fn a_resumed_session_still_hears_what_was_withdrawn() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = 1_791_900_000_000;
+        let saves = store.decide(&project(), Some("Saves don't matter"), None, "cli", t0).unwrap().entry.id;
+        store.decide(&project(), Some("AC isn't the default"), None, "cli", t0).unwrap();
+        let start = |source: &str, now: i64| {
+            let payload =
+                json!({ "hook_event_name": "SessionStart", "session_id": "s1", "cwd": DIR, "source": source });
+            send(&store, Host::Claude, payload, now)
+        };
+        let prompt = |now: i64| {
+            let payload =
+                json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": DIR, "prompt": "go" });
+            send(&store, Host::Claude, payload, now)
+        };
+        assert!(start("startup", t0 + 1).unwrap().contains("Saves don't matter"));
+        assert!(prompt(t0 + 2).is_none(), "the briefing showed the board");
+
+        store.decide(&project(), None, Some(saves), "cli", t0 + 3).unwrap();
+        let resumed = start("resume", t0 + 4).expect("a briefing");
+        assert!(resumed.contains("AC isn't the default") && !resumed.contains("Saves"), "{resumed}");
+        let told = prompt(t0 + 5).expect("the withdrawal, which the board alone does not show");
+        assert!(told.contains(&format!("Withdrawn: #{saves} \\\"Saves don't matter\\\"")), "{told}");
     }
 
     #[test]

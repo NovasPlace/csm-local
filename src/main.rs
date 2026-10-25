@@ -3,6 +3,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use csm_local::brief::{self, BriefRequest};
+use csm_local::capture::absolute;
+use csm_local::claims::{self, peers_json};
 use csm_local::journal::{Checkpoint, EventQuery, EVENT_KINDS, MAX_HANDOFF_BYTES};
 use csm_local::mcp::{inbox_json, message_json, wait_for_messages, Server};
 use csm_local::messaging::NewMessage;
@@ -118,6 +120,24 @@ enum Command {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+    /// Put a standing decision you made on the project's board, which every session there sees
+    Decide {
+        /// The decision, in a sentence
+        decision: Option<String>,
+        /// Withdraw this standing decision; with DECISION, replace it
+        #[arg(long)]
+        withdraw: Option<i64>,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// List the project's standing decisions, newest first
+    Decisions {
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Print every entry, withdrawals included, as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show database location and counts
     Status {
         #[arg(long)]
@@ -130,7 +150,7 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Permanently delete project memories, journal events, messaging peers and their messages
+    /// Permanently delete project memories, journal events, messaging peers, their messages and the decision board
     Forget {
         #[arg(long)]
         project: PathBuf,
@@ -197,6 +217,24 @@ enum Command {
         timeout_seconds: u64,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+    },
+    /// Claim files for a peer for a limited time; advisory, nothing is locked (JSON)
+    Claim {
+        /// Exact hook-registered host:session ID that holds the claims
+        #[arg(long)]
+        peer: String,
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<String>,
+        #[arg(long, default_value_t = claims::DEFAULT_MINUTES)]
+        minutes: i64,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Release a peer's file claims: the files given, or all of them (JSON)
+    Release {
+        #[arg(long)]
+        peer: String,
+        files: Vec<String>,
     },
     /// Manage opt-in idle inbox wake-ups (no model credentials or terminal injection)
     Wake {
@@ -382,6 +420,15 @@ fn require_peer(store: &Store, peer: &str) -> Result<()> {
     Ok(())
 }
 
+/// Command-line file arguments as absolute paths, relative ones against the current folder.
+fn absolute_paths(files: &[String]) -> Result<Vec<String>> {
+    let cwd = std::env::current_dir()?.display().to_string();
+    if files.iter().any(|f| f.trim().is_empty()) {
+        return Err(Error::Invalid("file paths must not be empty".into()));
+    }
+    Ok(files.iter().map(|f| absolute(&cwd, f)).collect())
+}
+
 fn require_message_limit(limit: usize) -> Result<()> {
     if !(1..=100).contains(&limit) {
         return Err(Error::Invalid("limit must be 1..100".into()));
@@ -555,6 +602,23 @@ fn run(cli: Cli) -> Result<()> {
                 println!("Closed goal: {closed}");
             }
         }
+        Command::Decide { decision, withdraw, project } => {
+            let project = resolve_project(&store, project)?;
+            let decided = store.decide(&project, decision.as_deref(), withdraw, "cli", now_ms())?;
+            println!("{}", decided.summary());
+        }
+        Command::Decisions { project, json } => {
+            let project = resolve_project(&store, project)?;
+            if json {
+                print_json(&store.decision_history(Some(&project))?);
+            } else {
+                let board = store.decisions(&project)?;
+                if board.is_empty() {
+                    println!("No standing decisions on this project's board.");
+                }
+                board.iter().for_each(|d| println!("{}", d.line(now_ms())));
+            }
+        }
         Command::Status { project } => {
             let project = resolve_project(&store, project)?;
             let stats = store.stats(Some(&project))?;
@@ -564,6 +628,7 @@ fn run(cli: Cli) -> Result<()> {
             println!("memories in this project: {}", stats.project_memories.unwrap_or(0));
             println!("memories total: {} across {} project(s)", stats.memories, stats.projects);
             println!("journal events in this project: {}", stats.events);
+            println!("standing decisions in this project: {}", store.decisions(&project)?.len());
             if let Some((host, bytes, _)) = store.last_injection()? {
                 println!("last briefing injected: {bytes} bytes via {host}");
             }
@@ -621,7 +686,11 @@ fn run(cli: Cli) -> Result<()> {
             let project = resolve_project(&store, project)?;
             let scope = (!all).then_some(project.as_str());
             let events = store.events(&EventQuery { project: scope, limit: usize::MAX >> 1, ..Default::default() })?;
-            print_json(&serde_json::json!({ "memories": store.export(scope)?, "events": events }));
+            print_json(&serde_json::json!({
+                "memories": store.export(scope)?,
+                "events": events,
+                "decisions": store.decision_history(scope)?,
+            }));
         }
         Command::Forget { project, yes } => {
             let project = stored_project_key(&store, &project)?;
@@ -630,6 +699,7 @@ fn run(cli: Cli) -> Result<()> {
             let (messages, peers) = store.mailbox_project_counts(&project)?;
             let links =
                 store.links()?.into_iter().filter(|(folder, into)| *folder == project || *into == project).count();
+            let decisions = store.decision_history(Some(&project))?.len();
             if yes {
                 // Always scrub, even with nothing left to delete: a run that
                 // was blocked by another process finishes here.
@@ -639,6 +709,7 @@ fn run(cli: Cli) -> Result<()> {
                     && forgotten.messages == 0
                     && forgotten.peers == 0
                     && forgotten.links == 0
+                    && forgotten.decisions == 0
                 {
                     println!("Nothing is stored for {project}.");
                 } else {
@@ -655,6 +726,9 @@ fn run(cli: Cli) -> Result<()> {
                     if forgotten.links > 0 {
                         println!("Removed {} folder link(s) into or out of {project}.", forgotten.links);
                     }
+                    if forgotten.decisions > 0 {
+                        println!("Also deleted {} decision board entries.", forgotten.decisions);
+                    }
                 }
                 if !forgotten.scrubbed {
                     println!(
@@ -663,7 +737,7 @@ fn run(cli: Cli) -> Result<()> {
                          to finish scrubbing."
                     );
                 }
-            } else if memories == 0 && events == 0 && messages == 0 && peers == 0 && links == 0 {
+            } else if memories == 0 && events == 0 && messages == 0 && peers == 0 && links == 0 && decisions == 0 {
                 println!("Nothing is stored for {project}.");
             } else {
                 println!(
@@ -675,13 +749,14 @@ fn run(cli: Cli) -> Result<()> {
                 if links > 0 {
                     println!("Would also remove {links} folder link(s) into or out of {project}.");
                 }
+                if decisions > 0 {
+                    println!("Would also delete {decisions} decision board entries.");
+                }
             }
         }
         Command::Peers { project, all_projects, include_stale } => {
             let project = resolve_project(&store, project)?;
-            print_json(
-                &serde_json::json!({"peers": store.peers((!all_projects).then_some(project.as_str()), now_ms(), include_stale)?}),
-            );
+            print_json(&peers_json(&store, (!all_projects).then_some(project.as_str()), now_ms(), include_stale)?);
         }
         Command::Send { from, to, request_id, content, reply_to, allow_cross_project, ttl_seconds } => {
             require_peer(&store, &from)?;
@@ -723,6 +798,19 @@ fn run(cli: Cli) -> Result<()> {
             require_peer(&store, &peer)?;
             let messages = wait_for_messages(&store, &peer, timeout_seconds, limit)?;
             print_json(&inbox_json(&peer, &messages));
+        }
+        Command::Claim { peer, files, minutes, note } => {
+            require_peer(&store, &peer)?;
+            let holder = store.peer(&peer)?.expect("checked above");
+            let paths = absolute_paths(&files)?;
+            let now = now_ms();
+            print_json(&store.claim_files(&holder, &paths, minutes, note.as_deref(), now)?.json(&peer, now));
+        }
+        Command::Release { peer, files } => {
+            require_peer(&store, &peer)?;
+            let paths = absolute_paths(&files)?;
+            let released = store.release_claims(&peer, (!paths.is_empty()).then_some(paths.as_slice()))?;
+            print_json(&serde_json::json!({"peer": peer, "released": released}));
         }
         Command::Wake { action } => match action {
             WakeCommand::Enable => {
