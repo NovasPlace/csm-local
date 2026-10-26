@@ -90,6 +90,11 @@ is reported instead. Claims are advisory: nothing is locked. They end with
 `csm_release`, at expiry, or when the holding session ends. A quiet session
 that still holds claims stays listed in `csm_peers` as stale.
 
+Subagents use their session's connection, so what they claim is the session's
+claim. The hooks note which subagent claimed each file: its sibling subagents
+are warned before editing it, the session itself is not, and the claim ends
+when that subagent stops, where the host reports that.
+
 ## Storage and limits
 
 Messages use separate tables in the existing local SQLite database. Their schema

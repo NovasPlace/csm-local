@@ -7,6 +7,11 @@
 //! Claims belong to a messaging identity (`csm_connect`), so there is always
 //! someone to ask. A claim ends when it is released, when it expires, or when
 //! the session holding it ends.
+//!
+//! Subagents share their session's MCP server, so their claims are the
+//! session's too. The `PostToolUse` hook, which knows which subagent made the
+//! call, marks each claim with it: sibling subagents are then warned about
+//! each other's files, and a subagent's claims end when it stops.
 
 use rusqlite::{params, Row};
 use serde_json::{json, Value};
@@ -28,7 +33,7 @@ const MAX_NOTE_BYTES: usize = 200;
 /// Claims one session can hold at once.
 const MAX_HELD: i64 = 100;
 const MINUTE_MS: i64 = 60_000;
-const COLUMNS: &str = "id, display, project, peer, note, claimed_at, expires_at";
+const COLUMNS: &str = "id, display, project, peer, note, claimed_at, expires_at, agent_id";
 /// A claim is in force until it expires or its session ends.
 const IN_FORCE: &str = "expires_at > ?1 AND peer NOT IN (SELECT id FROM csm_peers WHERE state = 'ended')";
 
@@ -44,6 +49,8 @@ pub struct Claim {
     pub note: String,
     pub claimed_at: i64,
     pub expires_at: i64,
+    /// The holder's subagent that claimed it; empty for the session itself.
+    pub agent_id: String,
 }
 
 impl Claim {
@@ -107,7 +114,7 @@ impl Store {
             |r| r.get(0),
         )?;
         if exists {
-            return Ok(());
+            return self.add_claim_agents();
         }
         let tx = self.immediate()?;
         tx.execute_batch(
@@ -120,12 +127,34 @@ CREATE TABLE IF NOT EXISTS csm_file_claims (
     peer       TEXT    NOT NULL,
     note       TEXT    NOT NULL DEFAULT '',
     claimed_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL
+    expires_at INTEGER NOT NULL,
+    agent_id   TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS csm_file_claims_path ON csm_file_claims (path);
 CREATE INDEX IF NOT EXISTS csm_file_claims_peer ON csm_file_claims (peer);
 ",
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The `agent_id` column came after the table. Older binaries never name
+    /// it, so their claims are the session's own.
+    fn add_claim_agents(&self) -> Result<()> {
+        let missing = |conn: &rusqlite::Connection| -> Result<bool> {
+            Ok(conn.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM pragma_table_info('csm_file_claims') WHERE name = 'agent_id')",
+                [],
+                |r| r.get(0),
+            )?)
+        };
+        if !missing(&self.conn)? {
+            return Ok(());
+        }
+        let tx = self.immediate()?;
+        if missing(&tx)? {
+            tx.execute_batch("ALTER TABLE csm_file_claims ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''")?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -234,11 +263,36 @@ CREATE INDEX IF NOT EXISTS csm_file_claims_peer ON csm_file_claims (peer);
         self.claims_where("1 = ?2", 1, now)
     }
 
-    /// Claims in force on any of absolute `paths` by sessions other than `peer`.
-    pub fn claims_on(&self, paths: &[String], peer: &str, now: i64) -> Result<Vec<Claim>> {
+    /// Marks `peer`'s claims on absolute `paths` as its subagent `agent_id`'s,
+    /// or, with an empty `agent_id`, as the session's own.
+    pub fn attribute_claims(&self, peer: &str, agent_id: &str, paths: &[String]) -> Result<usize> {
+        let mut marked = 0;
+        for path in paths {
+            marked += self.conn.execute(
+                "UPDATE csm_file_claims SET agent_id = ?3 WHERE peer = ?1 AND path = ?2",
+                params![peer, touch_key(path), agent_id],
+            )?;
+        }
+        Ok(marked)
+    }
+
+    /// Ends the claims `peer`'s subagent `agent_id` holds, when it stops.
+    pub fn release_agent_claims(&self, peer: &str, agent_id: &str) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM csm_file_claims WHERE peer = ?1 AND agent_id = ?2", params![peer, agent_id])?)
+    }
+
+    /// Claims in force on any of absolute `paths` by sessions other than
+    /// `peer`, and, when `agent_id` is one of its subagents, by its sibling
+    /// subagents. A session's own claims and its subagents' never count
+    /// against each other: the session handed that work out.
+    pub fn claims_on(&self, paths: &[String], peer: &str, agent_id: &str, now: i64) -> Result<Vec<Claim>> {
+        let counts =
+            |c: &Claim| c.peer != peer || (!agent_id.is_empty() && !c.agent_id.is_empty() && c.agent_id != agent_id);
         let mut claims = Vec::new();
         for path in paths {
-            claims.extend(self.claims_where("path = ?2", touch_key(path), now)?.into_iter().filter(|c| c.peer != peer));
+            claims.extend(self.claims_where("path = ?2", touch_key(path), now)?.into_iter().filter(counts));
         }
         Ok(claims)
     }
@@ -304,6 +358,7 @@ fn row_to_claim(r: &Row<'_>) -> rusqlite::Result<Claim> {
         note: r.get(4)?,
         claimed_at: r.get(5)?,
         expires_at: r.get(6)?,
+        agent_id: r.get(7)?,
     })
 }
 
@@ -349,8 +404,11 @@ mod tests {
             assert_eq!(second.held[0].peer, "codex:ef8f068b-1111");
             assert_eq!(second.claimed.len(), 1);
         }
-        assert_eq!(store.claims_on(&files(&["scripts/ground_field.gd"]), "claude:c1", NOW + MIN).unwrap().len(), 1);
-        assert!(store.claims_on(&files(&["scripts/ground_field.gd"]), "codex:ef8f068b-1111", NOW).unwrap().is_empty());
+        assert_eq!(store.claims_on(&files(&["scripts/ground_field.gd"]), "claude:c1", "", NOW + MIN).unwrap().len(), 1);
+        assert!(store
+            .claims_on(&files(&["scripts/ground_field.gd"]), "codex:ef8f068b-1111", "", NOW)
+            .unwrap()
+            .is_empty());
         assert_eq!(holder(&store, "codex:ef8f068b-1111").unwrap(), "codex session ef8f068b");
     }
 
@@ -368,6 +426,46 @@ mod tests {
     }
 
     #[test]
+    fn a_subagents_claims_count_against_its_siblings_and_end_with_it() {
+        let store = Store::open_in_memory().unwrap();
+        let session = peer(&store, "claude:s1", NOW);
+        let parser = files(&["src/parser.rs"]);
+        store.claim_files(&session, &parser, 30, Some("parser rework"), NOW).unwrap();
+        assert_eq!(store.attribute_claims("claude:s1", "a1", &parser).unwrap(), 1);
+
+        let on = |agent: &str| store.claims_on(&parser, "claude:s1", agent, NOW).unwrap().len();
+        assert_eq!((on("a2"), on("a1"), on("")), (1, 0, 0), "a sibling's, its own, the parent's");
+        assert_eq!(store.claims_on(&parser, "codex:x", "", NOW).unwrap()[0].agent_id, "a1");
+
+        // Claimed by the session itself, it no longer counts against subagents.
+        store.attribute_claims("claude:s1", "", &parser).unwrap();
+        assert_eq!(on("a2"), 0);
+        store.attribute_claims("claude:s1", "a1", &parser).unwrap();
+        assert_eq!(store.release_agent_claims("claude:s1", "a2").unwrap(), 0);
+        assert_eq!(store.release_agent_claims("claude:s1", "a1").unwrap(), 1);
+        assert!(store.active_claims(NOW).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_claims_table_from_before_subagents_gains_the_column() {
+        let store = Store::open_in_memory().unwrap();
+        let codex = peer(&store, "codex:a", NOW);
+        store.conn.execute_batch("ALTER TABLE csm_file_claims DROP COLUMN agent_id").unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO csm_file_claims (path, display, project, peer, note, claimed_at, expires_at)
+                 VALUES ('x', 'C:/work/game/a.gd', ?1, 'codex:a', '', ?2, ?3)",
+                params![P, NOW, NOW + 30 * MIN],
+            )
+            .unwrap();
+        store.init_claims().unwrap();
+        store.init_claims().unwrap();
+        assert_eq!(store.active_claims(NOW).unwrap()[0].agent_id, "");
+        assert_eq!(store.claim_files(&codex, &files(&["b.gd"]), 5, None, NOW).unwrap().claimed.len(), 1);
+    }
+
+    #[test]
     fn claims_lapse_at_expiry_and_when_the_session_ends() {
         let store = Store::open_in_memory().unwrap();
         let codex = peer(&store, "codex:a", NOW);
@@ -378,7 +476,7 @@ mod tests {
 
         store.claim_files(&codex, &files(&["b.gd"]), 30, None, NOW).unwrap();
         store.set_peer_state("codex:a", "ended", NOW + MIN).unwrap();
-        assert!(store.claims_on(&files(&["b.gd"]), "claude:b", NOW + MIN).unwrap().is_empty(), "ended");
+        assert!(store.claims_on(&files(&["b.gd"]), "claude:b", "", NOW + MIN).unwrap().is_empty(), "ended");
         let refused = store.claim_files(&codex, &files(&["c.gd"]), 5, None, NOW + MIN).unwrap_err();
         assert!(refused.to_string().contains("has ended"), "{refused}");
         assert_eq!(store.prune_claims(NOW + 10 * MIN).unwrap(), 1, "the lapsed claim on a.gd");

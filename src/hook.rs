@@ -357,6 +357,17 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             if event_name == "PostToolUseFailure" {
                 return Ok(None);
             }
+            // The MCP server is shared with the session's subagents and cannot
+            // tell them apart; this hook can, so it says whose claims they are.
+            if field("tool_name").is_some_and(|t| t == "csm_claim" || t.ends_with("__csm_claim")) {
+                let paths = claimed_paths(&payload["tool_response"]);
+                if !paths.is_empty() {
+                    let peer = format!("{}:{session_id}", host.name());
+                    if let Err(e) = store.attribute_claims(&peer, &agent_id, &paths) {
+                        log_failure(host.name(), &e.to_string());
+                    }
+                }
+            }
             board_context(store, host, session_id, &agent_id, &project, event_name, env)
         }
         // Before an edit: say so if another running session just edited the
@@ -391,6 +402,9 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             let reply = field("last_assistant_message");
             if let Some(dedup_key) = turn_key(store, host, session_id, &agent_id, "turn_end", turn, reply)? {
                 store.record_at(NewEvent { kind: "turn_end".into(), summary, dedup_key, ..base }, env.now)?;
+            }
+            if event_name == "SubagentStop" && !agent_id.is_empty() {
+                store.release_agent_claims(&format!("{}:{session_id}", host.name()), &agent_id)?;
             }
             Ok(None)
         }
@@ -516,6 +530,28 @@ fn board_context(
     Ok(notice.map(|text| {
         json!({ "hookSpecificOutput": { "hookEventName": event_name, "additionalContext": text } }).to_string()
     }))
+}
+
+/// The files a `csm_claim` call left its caller holding, read from the
+/// call's result in any shape a host passes it: the result JSON, its text,
+/// or MCP content blocks. An error, or anything unreadable, names none.
+fn claimed_paths(response: &Value) -> Vec<String> {
+    let blocks = response.as_array().or_else(|| response["content"].as_array());
+    let mut results: Vec<Value> = blocks
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .chain(response.as_str())
+        .filter_map(|text| serde_json::from_str(text).ok())
+        .collect();
+    if response.get("claimed").is_some() {
+        results.push(response.clone());
+    }
+    results
+        .iter()
+        .flat_map(|result| result["claimed"].as_array().into_iter().flatten())
+        .filter_map(|claim| claim["path"].as_str().map(String::from))
+        .collect()
 }
 
 /// The project a hook's folder belongs to, following `csm link`.
@@ -882,6 +918,52 @@ mod tests {
         assert!(!text.contains("csm_send"), "{text}");
         assert!(send(&store, Host::Claude, by("a2", "PreToolUse"), t0 + 121_000).is_none(), "said once");
         assert!(send(&store, Host::Claude, by("", "PreToolUse"), t0 + 122_000).is_none(), "the parent handed it out");
+    }
+
+    #[test]
+    fn a_subagents_claim_is_its_own_and_ends_when_it_stops() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = 1_791_900_000_000;
+        let session = store.register_peer(&project(), "claude", "s1", None, "active", t0).unwrap();
+        let file = format!("{DIR}/src/x.rs");
+        // The shared MCP server records a1's csm_claim as the session's; the hook knows it was a1.
+        let claimed = store.claim_files(&session, std::slice::from_ref(&file), 30, Some("x rework"), t0).unwrap();
+        let post = json!({ "hook_event_name": "PostToolUse", "session_id": "s1", "agent_id": "a1", "cwd": DIR,
+                           "tool_name": "mcp__csm__csm_claim", "tool_use_id": "c1", "tool_input": { "files": [file] },
+                           "tool_response": [{ "type": "text", "text": claimed.json(&session.id, t0).to_string() }] });
+        send(&store, Host::Claude, post, t0 + 1);
+
+        let pre = |agent: &str| {
+            let mut payload = edit("s1", "Edit", "PreToolUse", "src/x.rs");
+            if !agent.is_empty() {
+                payload["agent_id"] = json!(agent);
+            }
+            payload
+        };
+        let out = send(&store, Host::Claude, pre("a2"), t0 + 2).expect("the sibling's claim");
+        assert!(out.contains("src/x.rs is claimed by another subagent working for the same session"), "{out}");
+        assert!(send(&store, Host::Claude, pre(""), t0 + 3).is_none(), "the parent handed it out");
+
+        let stop = json!({ "hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": "a1", "cwd": DIR,
+                           "last_assistant_message": "done" });
+        send(&store, Host::Claude, stop, t0 + 4);
+        assert!(store.active_claims(t0 + 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reads_claimed_files_from_any_shape_of_mcp_result() {
+        let result = json!({ "peer": "claude:s1", "claimed": [{ "path": "C:/a.rs" }], "held_by_others": [{ "path": "C:/b.rs" }] });
+        let text = result.to_string();
+        for shape in [
+            json!([{ "type": "text", "text": text }]),
+            json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
+            json!(text),
+            result.clone(),
+        ] {
+            assert_eq!(claimed_paths(&shape), ["C:/a.rs"], "{shape}");
+        }
+        assert!(claimed_paths(&json!([{ "type": "text", "text": "Messaging identity is not connected." }])).is_empty());
+        assert!(claimed_paths(&Value::Null).is_empty());
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub const LEASE_WINDOW_MS: i64 = 30 * 60_000;
 /// Touches older than this are pruned; only the lease window is ever read.
 const KEEP_TOUCHES_MS: i64 = 24 * 3_600_000;
 const MAX_FILES_NAMED: usize = 3;
+/// How a warning names another subagent of the asking one's session.
+const SIBLING: &str = "another subagent working for the same session";
 
 /// Lookup key for an absolute path: forward slashes, no trailing slash, and
 /// case-folded on Windows, where `C:/Repo` and `c:/repo` are the same file.
@@ -164,17 +166,26 @@ pub fn collision_notice(
 ) -> Result<Option<String>> {
     let mut claimed = Vec::new();
     let mut sources = Vec::new();
-    for claim in store.claims_on(paths, &format!("{}:{session_id}", host.name()), now)? {
+    let me = format!("{}:{session_id}", host.name());
+    for claim in store.claims_on(paths, &me, agent_id, now)? {
         if claimed.len() == MAX_FILES_NAMED {
             break;
         }
         let file = rel_path(&[project.to_string()], project, &claim.path);
         let note = if claim.note.is_empty() { String::new() } else { format!(": \"{}\"", truncate(&claim.note, 120)) };
-        let line =
-            format!("{file} is claimed by {} {}{note}.", claims::holder(store, &claim.peer)?, claim.remaining(now));
-        let trigger = format!("lease:claim:{}", claim.id);
+        // A sibling's claim is held under the asking session itself.
+        let sibling = claim.peer == me;
+        let holder = if sibling { SIBLING.to_string() } else { claims::holder(store, &claim.peer)? };
+        let line = format!("{file} is claimed by {holder} {}{note}.", claim.remaining(now));
+        let trigger = if sibling {
+            format!("lease:claim:{}:{}", claim.id, claim.agent_id)
+        } else {
+            format!("lease:claim:{}", claim.id)
+        };
         if store.claim_injection(project, host.name(), session_id, agent_id, &trigger, None, &line, &[], now)? {
-            sources.push(claim.peer.clone());
+            if !sibling {
+                sources.push(claim.peer.clone());
+            }
             claimed.push(line);
         }
     }
@@ -190,7 +201,7 @@ pub fn collision_notice(
         }
         let file = rel_path(&[project.to_string()], project, &touch.display);
         let by = if sibling {
-            "another subagent working for the same session".to_string()
+            SIBLING.to_string()
         } else {
             format!("another session that is still running ({})", who(store, &touch)?)
         };
@@ -365,6 +376,27 @@ mod tests {
         let other = vec!["C:/work/app/src/lib.rs".to_string()];
         store.touch_files(P, "claude", "s1", "", &other, NOW).unwrap();
         assert!(collision_notice(&store, Host::Claude, "s1", "a3", P, &other, NOW + MIN).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_subagent_is_told_which_files_a_sibling_claimed() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.register_peer(P, "claude", "s1", None, "active", NOW).unwrap();
+        store.claim_files(&session, &file(), 30, Some("router rework"), NOW).unwrap();
+        store.attribute_claims("claude:s1", "a1", &file()).unwrap();
+
+        let text = collision_notice(&store, Host::Claude, "s1", "a2", P, &file(), NOW).unwrap().expect("a warning");
+        assert!(
+            text.starts_with(
+                "csm: src/main.rs is claimed by another subagent working for the same session for 30 more min (until "
+            ),
+            "{text}"
+        );
+        assert!(text.ends_with("UTC): \"router rework\"."), "no csm_send for a sibling: {text}");
+        assert!(collision_notice(&store, Host::Claude, "s1", "a2", P, &file(), NOW).unwrap().is_none(), "said once");
+        assert!(collision_notice(&store, Host::Claude, "s1", "", P, &file(), NOW).unwrap().is_none(), "handed out");
+        let other = collision_notice(&store, Host::Codex, "x", "", P, &file(), NOW).unwrap().unwrap();
+        assert!(other.contains("is claimed by claude session s1") && other.contains("csm_send"), "{other}");
     }
 
     #[test]
