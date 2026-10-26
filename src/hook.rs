@@ -305,9 +305,10 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             if let Err(e) = &recorded {
                 log_failure(host.name(), &e.to_string());
             }
-            // Subagents work for a parent that already has the briefing.
+            // Subagents work for a parent that already has the briefing, but
+            // their context starts without the board.
             if !agent_id.is_empty() {
-                return Ok(None);
+                return board_context(store, host, session_id, &agent_id, &project, event_name, env);
             }
             let out = session_start_context(store, host, &project, session_id, source, env)?;
             if recorded.is_ok() {
@@ -359,17 +360,29 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             board_context(store, host, session_id, &agent_id, &project, event_name, env)
         }
         // Before an edit: say so if another running session just edited the
-        // same file. Advisory only; the edit goes ahead either way.
+        // same file, and what changed on the board, so a subagent makes its
+        // first edit knowing it. Advisory only; the edit goes ahead either way.
         "PreToolUse" => {
             let paths = target_files(payload);
             if paths.is_empty() {
                 return Ok(None);
             }
-            let notice = leases::collision_notice(store, host, session_id, &agent_id, &project, &paths, env.now)?;
-            Ok(notice.map(|text| {
+            let collision = leases::collision_notice(store, host, session_id, &agent_id, &project, &paths, env.now)?;
+            // A board error must not swallow the collision warning.
+            let board = decisions::board_notice(store, host.name(), session_id, &agent_id, &project, env.now)
+                .unwrap_or_else(|e| {
+                    log_failure(host.name(), &e.to_string());
+                    None
+                });
+            let notices: Vec<String> = collision.into_iter().chain(board).collect();
+            if notices.is_empty() {
+                return Ok(None);
+            }
+            let text = notices.join("\n\n");
+            Ok(Some(
                 json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": text } })
-                    .to_string()
-            }))
+                    .to_string(),
+            ))
         }
         // csm never blocks a Stop, so `stop_hook_active` (another hook made
         // the turn continue) is just one more reply, and the latest wins.
@@ -487,8 +500,9 @@ fn session_start_context(
     Ok(Some(out.to_string()))
 }
 
-/// Tells a running session about changes to the decision board since it last
-/// saw it. Subagents are left out; they work for a parent that is told.
+/// Tells a running session, or one of its subagents, about changes to the
+/// decision board since it last saw it. A subagent's first notice is the
+/// whole board: it starts without its parent's briefing.
 fn board_context(
     store: &Store,
     host: Host,
@@ -498,10 +512,7 @@ fn board_context(
     event_name: &str,
     env: &HookEnv,
 ) -> Result<Option<String>> {
-    if !agent_id.is_empty() {
-        return Ok(None);
-    }
-    let notice = decisions::board_notice(store, host.name(), session_id, project, env.now)?;
+    let notice = decisions::board_notice(store, host.name(), session_id, agent_id, project, env.now)?;
     Ok(notice.map(|text| {
         json!({ "hookSpecificOutput": { "hookEventName": event_name, "additionalContext": text } }).to_string()
     }))
@@ -797,6 +808,50 @@ mod tests {
         claude_session(&store, "s1", 10);
         let sub = json!({ "hook_event_name": "SessionStart", "session_id": "s2", "agent_id": "a1", "cwd": DIR, "source": "startup" });
         assert!(send(&store, Host::Codex, sub, 100).is_none());
+    }
+
+    #[test]
+    fn a_subagent_is_shown_the_board_without_using_up_its_parents_notice() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = 1_791_900_000_000;
+        store.decide(&project(), Some("Saves don't matter"), None, "cli", t0).unwrap();
+        let start = json!({ "hook_event_name": "SessionStart", "session_id": "s1", "cwd": DIR, "source": "startup" });
+        assert!(send(&store, Host::Claude, start, t0 + 1).unwrap().contains("Saves don't matter"));
+        let codex =
+            json!({ "hook_event_name": "UserPromptSubmit", "session_id": "codex-1", "cwd": DIR, "prompt": "rework" });
+        send(&store, Host::Codex, codex, t0 + 2);
+        send(&store, Host::Codex, edit("codex-1", "apply_patch", "PostToolUse", "src/x.rs"), t0 + 3);
+        let sub = |mut payload: Value| {
+            payload["agent_id"] = json!("a1");
+            payload
+        };
+
+        // Before its first edit the subagent hears the collision and the board.
+        let out = send(&store, Host::Claude, sub(edit("s1", "Edit", "PreToolUse", "src/x.rs")), t0 + 4)
+            .expect("the warning and the board");
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let text = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        let (warning, board) = text.split_once("\n\n").expect("two notices");
+        assert!(warning.starts_with("csm: src/x.rs was edited"), "{text}");
+        assert!(board.starts_with("csm: Standing decisions the user made for this project:"), "{text}");
+        assert!(board.contains("Saves don't matter"), "{text}");
+        assert!(send(&store, Host::Claude, sub(edit("s1", "Edit", "PostToolUse", "src/x.rs")), t0 + 5).is_none());
+
+        // A change reaches the subagent on any tool call, and its parent separately.
+        store.decide(&project(), Some("AC isn't the default"), None, "cli", t0 + 6).unwrap();
+        let read = json!({ "hook_event_name": "PostToolUse", "session_id": "s1", "cwd": DIR, "tool_name": "Read",
+                           "tool_use_id": "r1", "tool_input": { "file_path": format!("{DIR}/src/x.rs") }, "tool_response": {} });
+        assert!(send(&store, Host::Claude, sub(read), t0 + 7).unwrap().contains("AC isn't the default"));
+        let prompt =
+            json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": DIR, "prompt": "go on" });
+        assert!(send(&store, Host::Claude, prompt, t0 + 8).unwrap().contains("AC isn't the default"));
+
+        // A host that reports a subagent's start shows it the board then, not the briefing.
+        let codex_sub = json!({ "hook_event_name": "SessionStart", "session_id": "root", "agent_id": "a9", "cwd": DIR,
+                                "source": "startup" });
+        let out = send(&store, Host::Codex, codex_sub, t0 + 9).expect("the board");
+        assert!(out.contains("\"hookEventName\":\"SessionStart\""), "{out}");
+        assert!(out.contains("csm: Standing decisions") && !out.contains("Previous session"), "{out}");
     }
 
     #[test]

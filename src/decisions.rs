@@ -2,7 +2,9 @@
 //! as "saves don't matter during these test runs". The user tells one
 //! session; the board makes sure every session in the project knows. The
 //! briefing at session start lists it, and a session that is already running
-//! is told on its next prompt or tool call after the board changes.
+//! is told on its next prompt or tool call after the board changes. A
+//! subagent starts without its parent's briefing, so its first tool call
+//! shows it the whole board.
 //!
 //! Entries are append-only. Withdrawing a decision, or replacing it with a
 //! new one, is an entry too, so what changed since a session last looked is
@@ -252,20 +254,31 @@ CREATE TABLE IF NOT EXISTS csm_decisions_seen (
 /// for the host to show the agent, or `None` when nothing did. A session
 /// that has never seen the board gets all of it. Changes the session made
 /// itself are left out.
-pub fn board_notice(store: &Store, host: &str, session_id: &str, project: &str, now: i64) -> Result<Option<String>> {
+///
+/// A subagent (`agent_id` set) has a context of its own, so it keeps its own
+/// marker and hears its parent's changes too.
+pub fn board_notice(
+    store: &Store,
+    host: &str,
+    session_id: &str,
+    agent_id: &str,
+    project: &str,
+    now: i64,
+) -> Result<Option<String>> {
     let latest = store.latest_decision(project)?;
-    let Some(seen) = store.advance_decisions_seen(host, session_id, project, latest, now)? else {
+    let Some(seen) = store.advance_decisions_seen(host, &seen_key(session_id, agent_id), project, latest, now)? else {
         return Ok(None);
     };
     // Bounded by `latest` too: an entry added since then is the next notice's news.
     let new = |id: i64| id > seen && id <= latest;
-    let me = format!("{host}:{session_id}");
+    let me = agent_id.is_empty().then(|| format!("{host}:{session_id}"));
+    let by_me = |d: &Decision| me.as_deref() == Some(d.recorded_by.as_str());
     let standing = store.decisions(project)?;
-    let added: Vec<&Decision> = standing.iter().rev().filter(|d| new(d.id) && d.recorded_by != me).collect();
+    let added: Vec<&Decision> = standing.iter().rev().filter(|d| new(d.id) && !by_me(d)).collect();
     let mut withdrawn = Vec::new();
     for entry in store.decision_history(Some(project))? {
         // Only decisions this session could have seen are news when withdrawn.
-        if let Some(old) = entry.withdraws.filter(|old| new(entry.id) && *old <= seen && entry.recorded_by != me) {
+        if let Some(old) = entry.withdraws.filter(|old| new(entry.id) && *old <= seen && !by_me(&entry)) {
             withdrawn.extend(store.decision(old)?);
         }
     }
@@ -288,6 +301,16 @@ pub fn board_notice(store: &Store, host: &str, session_id: &str, project: &str, 
     }
     let lead = if seen == 0 { "" } else { "The user's standing decisions for this project changed. " };
     Ok(Some(format!("csm: {lead}{} csm_decisions lists the board.", parts.join(" "))))
+}
+
+/// Where a subagent's "seen up to" marker is kept: beside its parent's, in
+/// the same table, so the schema older binaries write to stays as it is.
+fn seen_key(session_id: &str, agent_id: &str) -> String {
+    if agent_id.is_empty() {
+        session_id.to_string()
+    } else {
+        format!("{session_id}/{agent_id}")
+    }
 }
 
 /// "codex ef8f068b" for a session, otherwise as recorded ("cli", "mcp").
@@ -385,26 +408,26 @@ mod tests {
     #[test]
     fn a_running_session_hears_each_change_once() {
         let store = Store::open_in_memory().unwrap();
-        assert!(board_notice(&store, "codex", "s1", P, NOW).unwrap().is_none(), "empty board");
+        assert!(board_notice(&store, "codex", "s1", "", P, NOW).unwrap().is_none(), "empty board");
         let saves = decide(&store, "Saves don't matter", "claude:aaaa1111-2222", NOW - 2 * MIN);
 
-        let first = board_notice(&store, "codex", "s1", P, NOW).unwrap().expect("the whole board");
+        let first = board_notice(&store, "codex", "s1", "", P, NOW).unwrap().expect("the whole board");
         assert_eq!(
             first,
             format!("csm: Standing decisions the user made for this project: #{saves} \"Saves don't matter\" (2m ago, recorded via claude aaaa1111). csm_decisions lists the board.")
         );
-        assert!(board_notice(&store, "codex", "s1", P, NOW + MIN).unwrap().is_none(), "said once");
+        assert!(board_notice(&store, "codex", "s1", "", P, NOW + MIN).unwrap().is_none(), "said once");
 
         let ac = decide(&store, "AC isn't the default", "cli", NOW + 2 * MIN);
         store.decide(P, None, Some(saves), "cli", NOW + 3 * MIN).unwrap();
-        let change = board_notice(&store, "codex", "s1", P, NOW + 4 * MIN).unwrap().expect("a change");
+        let change = board_notice(&store, "codex", "s1", "", P, NOW + 4 * MIN).unwrap().expect("a change");
         assert_eq!(
             change,
             format!("csm: The user's standing decisions for this project changed. New: #{ac} \"AC isn't the default\" (2m ago, recorded via cli). Withdrawn: #{saves} \"Saves don't matter\". csm_decisions lists the board.")
         );
 
         // Another session that never looked gets the board as it stands now.
-        let fresh = board_notice(&store, "claude", "s2", P, NOW + 4 * MIN).unwrap().unwrap();
+        let fresh = board_notice(&store, "claude", "s2", "", P, NOW + 4 * MIN).unwrap().unwrap();
         assert!(fresh.contains("AC isn't the default") && !fresh.contains("Saves"), "{fresh}");
     }
 
@@ -412,21 +435,41 @@ mod tests {
     fn a_session_is_not_told_about_its_own_changes() {
         let store = Store::open_in_memory().unwrap();
         store.decide(P, Some("Saves don't matter"), None, "codex:s1", NOW).unwrap();
-        assert!(board_notice(&store, "codex", "s1", P, NOW).unwrap().is_none());
-        assert!(board_notice(&store, "claude", "s2", P, NOW).unwrap().is_some());
+        assert!(board_notice(&store, "codex", "s1", "", P, NOW).unwrap().is_none());
+        assert!(board_notice(&store, "claude", "s2", "", P, NOW).unwrap().is_some());
         // Seen markers are per project.
         store.decide("C:/other", Some("Ship Fridays"), None, "cli", NOW).unwrap();
-        assert!(board_notice(&store, "claude", "s2", P, NOW).unwrap().is_none());
+        assert!(board_notice(&store, "claude", "s2", "", P, NOW).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_subagent_hears_the_whole_board_and_its_parents_changes() {
+        let store = Store::open_in_memory().unwrap();
+        decide(&store, "Saves don't matter", "claude:s1", NOW);
+        decide(&store, "AC isn't the default", "cli", NOW);
+        let parent = board_notice(&store, "claude", "s1", "", P, NOW).unwrap().unwrap();
+        assert!(!parent.contains("Saves"), "{parent}");
+
+        let sub = board_notice(&store, "claude", "s1", "a1", P, NOW + MIN).unwrap().expect("the whole board");
+        assert!(sub.starts_with("csm: Standing decisions the user made for this project:"), "{sub}");
+        assert!(sub.contains("Saves don't matter") && sub.contains("AC isn't the default"), "{sub}");
+        assert!(board_notice(&store, "claude", "s1", "a1", P, NOW + MIN).unwrap().is_none(), "said once");
+        assert!(board_notice(&store, "claude", "s1", "a2", P, NOW + MIN).unwrap().is_some(), "each subagent");
+
+        let ship = decide(&store, "Ship Fridays", "claude:s1", NOW + 2 * MIN);
+        assert!(board_notice(&store, "claude", "s1", "", P, NOW + 3 * MIN).unwrap().is_none(), "the parent's own");
+        let change = board_notice(&store, "claude", "s1", "a1", P, NOW + 3 * MIN).unwrap().expect("news to a1");
+        assert!(change.contains(&format!("New: #{ship} \"Ship Fridays\"")), "{change}");
     }
 
     #[test]
     fn a_decision_withdrawn_before_the_session_saw_it_is_not_news() {
         let store = Store::open_in_memory().unwrap();
         decide(&store, "Keep", "cli", NOW);
-        board_notice(&store, "codex", "s1", P, NOW).unwrap();
+        board_notice(&store, "codex", "s1", "", P, NOW).unwrap();
         let brief = decide(&store, "Short-lived", "cli", NOW + 1);
         store.decide(P, None, Some(brief), "cli", NOW + 2).unwrap();
-        assert!(board_notice(&store, "codex", "s1", P, NOW + 3).unwrap().is_none());
+        assert!(board_notice(&store, "codex", "s1", "", P, NOW + 3).unwrap().is_none());
     }
 
     #[test]
@@ -451,9 +494,9 @@ mod tests {
                  END;"
             ))
             .unwrap();
-        let first = board_notice(&store, "codex", "s1", P, NOW).unwrap().unwrap();
+        let first = board_notice(&store, "codex", "s1", "", P, NOW).unwrap().unwrap();
         store.conn.execute_batch("DROP TRIGGER sneak").unwrap();
-        let second = board_notice(&store, "codex", "s1", P, NOW).unwrap().unwrap();
+        let second = board_notice(&store, "codex", "s1", "", P, NOW).unwrap().unwrap();
         assert!(first.contains("Keep") && !first.contains("Sneaked"), "{first}");
         assert!(second.contains("Sneaked") && !second.contains("Keep"), "{second}");
     }
@@ -464,9 +507,9 @@ mod tests {
         let folder = "C:/work/launcher";
         store.decide(folder, Some("Decided in the launcher"), None, "cli", NOW).unwrap();
         decide(&store, "Decided in the game", "cli", NOW + 1);
-        board_notice(&store, "codex", "s1", P, NOW + 2).unwrap();
+        board_notice(&store, "codex", "s1", "", P, NOW + 2).unwrap();
         store.link_project(folder, P).unwrap();
-        let told = board_notice(&store, "codex", "s1", P, NOW + 3).unwrap().expect("the merged board");
+        let told = board_notice(&store, "codex", "s1", "", P, NOW + 3).unwrap().expect("the merged board");
         assert!(told.contains("Decided in the launcher"), "{told}");
     }
 }

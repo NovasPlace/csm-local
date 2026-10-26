@@ -75,7 +75,9 @@ said them to. `csm_decide` (or `csm decide "..."`) puts a standing decision the
 user made, such as "saves don't matter: those real-game runs are deliberate",
 on the project's board. Every session sees the board in its briefing at session
 start, and a session that is already running is told on its next prompt or
-tool call after the board changes, once per change. `csm_decide` with
+tool call after the board changes, once per change. A subagent starts without
+its parent's briefing, so its first tool call shows it the whole board, and it
+is told each change after that. `csm_decide` with
 `withdraw` takes one back or replaces it; `csm_decisions` lists the board. The
 board works without messaging. Agents should record only what the user said or
 confirmed; entries are context for the work, not permission.
