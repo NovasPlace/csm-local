@@ -280,7 +280,7 @@ def verify_runtime(exe, base, skill, version, verify):
     installed = home / ".csm/bin/csm.exe"
     verify.check("installed_binary_matches_archive", installed.read_bytes() == exe.read_bytes())
     status = csm("setup_status", "setup", "--status", binary=installed)
-    verify.check("both_hosts_registered", "Claude Code: hooks 7/7 installed, MCP server registered" in status
+    verify.check("both_hosts_registered", "Claude Code: hooks 9/9 installed, MCP server registered" in status
                  and "Codex: hooks 6/6 installed, MCP server registered" in status)
     backup_root = home / ".csm/backups"
     backups = {p.relative_to(backup_root): p.read_bytes() for p in backup_root.rglob("*") if p.is_file()}

@@ -282,6 +282,18 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
         ..Default::default()
     };
     let turn = field("turn_id").or(field("prompt_id"));
+    let peer = format!("{}:{session_id}", host.name());
+    // A subagent that does anything after it stopped (another hook kept it
+    // going, or it was resumed) holds its paused claims again.
+    let active = matches!(
+        event_name,
+        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "UserPromptSubmit" | "SessionStart" | "SubagentStart"
+    );
+    if active && !agent_id.is_empty() {
+        if let Err(e) = store.resume_agent_claims(&peer, &agent_id) {
+            log_failure(host.name(), &e.to_string());
+        }
+    }
     // Redact the whole text first: cutting it could split a secret so the
     // patterns no longer recognize it.
     let captured = |key: &str, max: usize| match field(key) {
@@ -357,18 +369,25 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             if event_name == "PostToolUseFailure" {
                 return Ok(None);
             }
+            let mut notices = Vec::new();
             // The MCP server is shared with the session's subagents and cannot
             // tell them apart; this hook can, so it says whose claims they are.
             if field("tool_name").is_some_and(|t| t == "csm_claim" || t.ends_with("__csm_claim")) {
                 let paths = claimed_paths(&payload["tool_response"]);
                 if !paths.is_empty() {
-                    let peer = format!("{}:{session_id}", host.name());
-                    if let Err(e) = store.attribute_claims(&peer, &agent_id, &paths) {
-                        log_failure(host.name(), &e.to_string());
+                    match store.attribute_claims(&peer, &agent_id, &paths, env.now) {
+                        Ok(kept) => notices.extend(leases::kept_claims_notice(&kept, &project, env.now)),
+                        Err(e) => log_failure(host.name(), &e.to_string()),
                     }
                 }
             }
-            board_context(store, host, session_id, &agent_id, &project, event_name, env)
+            // A board error must not swallow what the claim just did.
+            match decisions::board_notice(store, host.name(), session_id, &agent_id, &project, env.now) {
+                Ok(board) => notices.extend(board),
+                Err(e) if !notices.is_empty() => log_failure(host.name(), &e.to_string()),
+                Err(e) => return Err(e),
+            }
+            Ok(context(event_name, &notices))
         }
         // Before an edit: say so if another running session just edited the
         // same file, and what changed on the board, so a subagent makes its
@@ -386,14 +405,7 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
                     None
                 });
             let notices: Vec<String> = collision.into_iter().chain(board).collect();
-            if notices.is_empty() {
-                return Ok(None);
-            }
-            let text = notices.join("\n\n");
-            Ok(Some(
-                json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": text } })
-                    .to_string(),
-            ))
+            Ok(context(event_name, &notices))
         }
         // csm never blocks a Stop, so `stop_hook_active` (another hook made
         // the turn continue) is just one more reply, and the latest wins.
@@ -403,8 +415,10 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             if let Some(dedup_key) = turn_key(store, host, session_id, &agent_id, "turn_end", turn, reply)? {
                 store.record_at(NewEvent { kind: "turn_end".into(), summary, dedup_key, ..base }, env.now)?;
             }
+            // Its claims pause rather than end: another hook may yet keep it
+            // going, and a resumed subagent still thinks it holds them.
             if event_name == "SubagentStop" && !agent_id.is_empty() {
-                store.release_agent_claims(&format!("{}:{session_id}", host.name()), &agent_id)?;
+                store.pause_agent_claims(&peer, &agent_id, env.now)?;
             }
             Ok(None)
         }
@@ -422,7 +436,7 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             let end = NewEvent { kind: "session_end".into(), summary: field("reason").unwrap_or("end").into(), ..base };
             store.record_at(end, env.now)?;
             if agent_id.is_empty() {
-                store.release_claims(&format!("{}:{session_id}", host.name()), None)?;
+                store.release_claims(&peer, None)?;
             }
             Ok(None)
         }
@@ -527,9 +541,16 @@ fn board_context(
     env: &HookEnv,
 ) -> Result<Option<String>> {
     let notice = decisions::board_notice(store, host.name(), session_id, agent_id, project, env.now)?;
-    Ok(notice.map(|text| {
-        json!({ "hookSpecificOutput": { "hookEventName": event_name, "additionalContext": text } }).to_string()
-    }))
+    Ok(context(event_name, notice.as_slice()))
+}
+
+/// The hook output that shows the agent `notices`, if there are any.
+fn context(event_name: &str, notices: &[String]) -> Option<String> {
+    if notices.is_empty() {
+        return None;
+    }
+    let text = notices.join("\n\n");
+    Some(json!({ "hookSpecificOutput": { "hookEventName": event_name, "additionalContext": text } }).to_string())
 }
 
 /// The files a `csm_claim` call left its caller holding, read from the
@@ -920,34 +941,97 @@ mod tests {
         assert!(send(&store, Host::Claude, by("", "PreToolUse"), t0 + 122_000).is_none(), "the parent handed it out");
     }
 
+    /// What the shared MCP server, then the hook, do for `agent`'s csm_claim.
+    fn claim_via_mcp(
+        store: &Store,
+        agent: &str,
+        file: &str,
+        minutes: i64,
+        note: Option<&str>,
+        now: i64,
+    ) -> Option<String> {
+        let session = store.register_peer(&project(), "claude", "s1", None, "active", now).unwrap();
+        let claimed = store.claim_files_unattributed(&session, &[file.to_string()], minutes, note, now).unwrap();
+        let mut post = json!({ "hook_event_name": "PostToolUse", "session_id": "s1", "cwd": DIR,
+                               "tool_name": "mcp__csm__csm_claim", "tool_use_id": format!("claim-{agent}-{now}"),
+                               "tool_input": { "files": [file] },
+                               "tool_response": [{ "type": "text", "text": claimed.json(&session.id, now).to_string() }] });
+        if !agent.is_empty() {
+            post["agent_id"] = json!(agent);
+        }
+        send(store, Host::Claude, post, now + 1)
+    }
+
+    fn subagent_stop(store: &Store, agent: &str, now: i64) {
+        let stop = json!({ "hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": agent, "cwd": DIR,
+                           "last_assistant_message": "done" });
+        send(store, Host::Claude, stop, now);
+    }
+
     #[test]
-    fn a_subagents_claim_is_its_own_and_ends_when_it_stops() {
+    fn a_subagents_claim_is_its_own_and_pauses_while_it_is_stopped() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = 1_791_900_000_000;
+        let file = format!("{DIR}/src/x.rs");
+        assert!(claim_via_mcp(&store, "a1", &file, 30, Some("x rework"), t0).is_none());
+
+        let by = |agent: &str, event: &str| {
+            let mut payload = edit("s1", "Edit", event, "src/x.rs");
+            if !agent.is_empty() {
+                payload["agent_id"] = json!(agent);
+                payload["tool_use_id"] = json!(format!("{agent}-{event}"));
+            }
+            payload
+        };
+        let out = send(&store, Host::Claude, by("a2", "PreToolUse"), t0 + 2).expect("the sibling's claim");
+        assert!(out.contains("src/x.rs is claimed by another subagent working for the same session"), "{out}");
+        assert!(send(&store, Host::Claude, by("", "PreToolUse"), t0 + 3).is_none(), "the parent handed it out");
+
+        subagent_stop(&store, "a1", t0 + 4);
+        assert!(store.active_claims(t0 + 5).unwrap().is_empty(), "paused while a1 is stopped");
+        // Another hook kept a1 going: its next tool call holds the file again.
+        send(&store, Host::Claude, by("a1", "PreToolUse"), t0 + 6);
+        assert_eq!(store.active_claims(t0 + 7).unwrap()[0].agent_id, "a1");
+
+        // Resumed later, it holds the file again from its start, before any tool call.
+        subagent_stop(&store, "a1", t0 + 8);
+        let start = json!({ "hook_event_name": "SubagentStart", "session_id": "s1", "agent_id": "a1",
+                            "agent_type": "general-purpose", "cwd": DIR });
+        assert!(send(&store, Host::Claude, start, t0 + 9).is_none(), "nothing to show at its start");
+        assert_eq!(store.active_claims(t0 + 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_sessions_and_siblings_claims_survive_a_subagents_reclaim_and_stop() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = 1_791_900_000_000;
+        let (x, y) = (format!("{DIR}/src/x.rs"), format!("{DIR}/src/y.rs"));
+        claim_via_mcp(&store, "", &x, 60, Some("parent rework"), t0);
+        claim_via_mcp(&store, "a1", &x, 30, None, t0 + 10);
+        claim_via_mcp(&store, "a1", &y, 30, Some("y rework"), t0 + 20);
+        let told = claim_via_mcp(&store, "a2", &y, 30, None, t0 + 30).expect("a2 hears y stays a1's");
+        assert!(told.contains("Your csm_claim did not make it yours."), "{told}");
+
+        subagent_stop(&store, "a2", t0 + 40);
+        let held = |file: &str| store.claims_on(&[file.to_string()], "codex:x", "", t0 + 50).unwrap();
+        assert_eq!(held(&x)[0].note, "parent rework", "the parent's claim outlives a1");
+        assert_eq!(held(&y)[0].agent_id, "a1", "a2 stopping does not end a1's claim");
+        subagent_stop(&store, "a1", t0 + 60);
+        assert_eq!((held(&x).len(), held(&y).len()), (1, 0));
+    }
+
+    #[test]
+    fn a_claim_through_an_older_mcp_server_draws_no_false_notice() {
         let store = Store::open_in_memory().unwrap();
         let t0 = 1_791_900_000_000;
         let session = store.register_peer(&project(), "claude", "s1", None, "active", t0).unwrap();
         let file = format!("{DIR}/src/x.rs");
-        // The shared MCP server records a1's csm_claim as the session's; the hook knows it was a1.
+        // A server started before the upgrade writes a new claim as the session's own.
         let claimed = store.claim_files(&session, std::slice::from_ref(&file), 30, Some("x rework"), t0).unwrap();
         let post = json!({ "hook_event_name": "PostToolUse", "session_id": "s1", "agent_id": "a1", "cwd": DIR,
                            "tool_name": "mcp__csm__csm_claim", "tool_use_id": "c1", "tool_input": { "files": [file] },
                            "tool_response": [{ "type": "text", "text": claimed.json(&session.id, t0).to_string() }] });
-        send(&store, Host::Claude, post, t0 + 1);
-
-        let pre = |agent: &str| {
-            let mut payload = edit("s1", "Edit", "PreToolUse", "src/x.rs");
-            if !agent.is_empty() {
-                payload["agent_id"] = json!(agent);
-            }
-            payload
-        };
-        let out = send(&store, Host::Claude, pre("a2"), t0 + 2).expect("the sibling's claim");
-        assert!(out.contains("src/x.rs is claimed by another subagent working for the same session"), "{out}");
-        assert!(send(&store, Host::Claude, pre(""), t0 + 3).is_none(), "the parent handed it out");
-
-        let stop = json!({ "hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": "a1", "cwd": DIR,
-                           "last_assistant_message": "done" });
-        send(&store, Host::Claude, stop, t0 + 4);
-        assert!(store.active_claims(t0 + 5).unwrap().is_empty());
+        assert!(send(&store, Host::Claude, post, t0 + 1).is_none());
     }
 
     #[test]

@@ -131,6 +131,13 @@ fn setup_registers_the_collision_hook_for_both_hosts() {
         "Edit|MultiEdit|Write|NotebookEdit"
     );
     assert_eq!(read("home/.codex/hooks.json")["hooks"]["PreToolUse"][0]["matcher"], "^apply_patch$");
+    // A subagent's stop and start pause and bring back its file claims; every subagent type counts.
+    for event in ["SubagentStop", "SubagentStart"] {
+        let group = &read("home/.claude/settings.json")["hooks"][event][0];
+        assert!(group.get("matcher").is_none(), "{event}: {group}");
+        assert!(group["hooks"][0]["command"].as_str().unwrap().contains(" hook claude"), "{event}: {group}");
+        assert!(read("home/.codex/hooks.json")["hooks"].get(event).is_none(), "{event}");
+    }
     let status = String::from_utf8(sb.csm(&["setup", "--status"], "").stdout).unwrap();
-    assert!(status.contains("Claude Code: hooks 7/7") && status.contains("Codex: hooks 6/6"), "{status}");
+    assert!(status.contains("Claude Code: hooks 9/9") && status.contains("Codex: hooks 6/6"), "{status}");
 }

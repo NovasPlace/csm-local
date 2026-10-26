@@ -203,7 +203,7 @@ impl Server {
         let paths = file_args(args)?;
         let minutes = bounded_int(args, "minutes", claims::DEFAULT_MINUTES, 1, claims::MAX_MINUTES)?;
         let now = now_ms();
-        let claimed = self.store.claim_files(&peer, &paths, minutes, str_arg(args, "note"), now)?;
+        let claimed = self.store.claim_files_unattributed(&peer, &paths, minutes, str_arg(args, "note"), now)?;
         Ok(claimed.json(&peer.id, now).to_string())
     }
 
@@ -642,7 +642,7 @@ fn tools() -> Value {
         },
         {
             "name": "csm_claim",
-            "description": "After csm_connect, claim files you are about to change for a limited time, so other sessions see who has them: in csm_peers, in their briefing, and as a warning before they edit one. Advisory; nothing is locked. A file another session already holds is not claimed, and its holder is reported so you can coordinate with csm_send. Claiming a file you hold extends it. Claims end with csm_release, at expiry, or when your session ends.",
+            "description": "After csm_connect, claim files you are about to change for a limited time, so other sessions see who has them: in csm_peers, in their briefing, and as a warning before they edit one. Advisory; nothing is locked. A file another session already holds is not claimed, and its holder is reported so you can coordinate with csm_send. Claiming a file you hold extends it. Claims end with csm_release, at expiry, or when your session ends; a subagent's pause while it is stopped.",
             "inputSchema": {"type": "object", "properties": {
                 "files": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20, "description": "Absolute paths, the way edit tools name files."},
                 "minutes": {"type": "integer", "minimum": 1, "maximum": 240, "default": 30},

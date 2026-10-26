@@ -61,9 +61,13 @@ const CLAUDE_HOOKS: &[HookSpec] = &[
     ("PostToolUseFailure", Some(CLAUDE_TOOLS), 5),
     ("Stop", None, 5),
     ("SessionEnd", None, 2),
-    // Collision warnings before an edit. Last, so adding it never moves the
-    // position of a hook that is already installed (and trusted).
+    // Added later, and at the end, so adding them never moves the position of
+    // a hook that is already installed (and trusted): collision warnings
+    // before an edit, then a subagent's stop and start, which pause and bring
+    // back its file claims.
     ("PreToolUse", Some(CLAUDE_EDIT_TOOLS), 5),
+    ("SubagentStop", None, 5),
+    ("SubagentStart", None, 5),
 ];
 const CLAUDE_EDIT_TOOLS: &str = "Edit|MultiEdit|Write|NotebookEdit";
 /// Codex runs every hook through PowerShell (about 200 ms each), so only

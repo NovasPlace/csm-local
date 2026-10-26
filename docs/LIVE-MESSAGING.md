@@ -92,8 +92,14 @@ that still holds claims stays listed in `csm_peers` as stale.
 
 Subagents use their session's connection, so what they claim is the session's
 claim. The hooks note which subagent claimed each file: its sibling subagents
-are warned before editing it, the session itself is not, and the claim ends
-when that subagent stops, where the host reports that.
+are warned before editing it, and the session itself is not. A subagent's
+claim pauses when it stops (Claude Code's `SubagentStop`) and holds again
+when it is resumed (`SubagentStart`) or does anything more; a paused claim
+gives way to the next claim on its file. A claim made through MCP on a file
+the session or a sibling already holds keeps that holder and its note and is
+only ever lengthened; a subagent that reached a sibling's file this way is
+told it did not become its own. The session can always take a file back by
+claiming it.
 
 ## Storage and limits
 

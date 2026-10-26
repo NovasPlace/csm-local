@@ -9,11 +9,12 @@
 use rusqlite::params;
 
 use crate::capture::{normalize, rel_path, Host};
+use crate::claims::{self, Claim};
 use crate::journal::EventQuery;
 use crate::store::{content_hash, Store};
 use crate::text::{one_line, truncate};
 use crate::time::ago;
-use crate::{claims, Result};
+use crate::Result;
 
 /// Another session's edit counts as "recent" for this long, and a session
 /// that has been quiet for this long no longer counts as running.
@@ -150,6 +151,25 @@ CREATE TABLE IF NOT EXISTS csm_project_links (
     }
 }
 
+/// What a subagent hears when its `csm_claim` reached files a sibling
+/// holds: the shared MCP server reported them as claimed.
+pub fn kept_claims_notice(kept: &[Claim], project: &str, now: i64) -> Option<String> {
+    if kept.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> =
+        kept.iter().take(MAX_FILES_NAMED).map(|claim| claim_line(claim, SIBLING, project, now)).collect();
+    let them = if kept.len() == 1 { "it" } else { "them" };
+    Some(format!("csm: {} Your csm_claim did not make {them} yours.", lines.join(" ")))
+}
+
+/// "src/x.rs is claimed by HOLDER for 18 more min (until 13:20 UTC): \"note\"."
+fn claim_line(claim: &Claim, holder: &str, project: &str, now: i64) -> String {
+    let file = rel_path(&[project.to_string()], project, &claim.path);
+    let note = if claim.note.is_empty() { String::new() } else { format!(": \"{}\"", truncate(&claim.note, 120)) };
+    format!("{file} is claimed by {holder} {}{note}.", claim.remaining(now))
+}
+
 /// The warning for a session about to edit `paths`, if another session has
 /// claimed any of them, or another running session, or a sibling subagent,
 /// edited any of them within the lease window. Each claim, and each (file,
@@ -171,12 +191,10 @@ pub fn collision_notice(
         if claimed.len() == MAX_FILES_NAMED {
             break;
         }
-        let file = rel_path(&[project.to_string()], project, &claim.path);
-        let note = if claim.note.is_empty() { String::new() } else { format!(": \"{}\"", truncate(&claim.note, 120)) };
         // A sibling's claim is held under the asking session itself.
         let sibling = claim.peer == me;
         let holder = if sibling { SIBLING.to_string() } else { claims::holder(store, &claim.peer)? };
-        let line = format!("{file} is claimed by {holder} {}{note}.", claim.remaining(now));
+        let line = claim_line(&claim, &holder, project, now);
         let trigger = if sibling {
             format!("lease:claim:{}:{}", claim.id, claim.agent_id)
         } else {
@@ -382,8 +400,15 @@ mod tests {
     fn a_subagent_is_told_which_files_a_sibling_claimed() {
         let store = Store::open_in_memory().unwrap();
         let session = store.register_peer(P, "claude", "s1", None, "active", NOW).unwrap();
-        store.claim_files(&session, &file(), 30, Some("router rework"), NOW).unwrap();
-        store.attribute_claims("claude:s1", "a1", &file()).unwrap();
+        store.claim_files_unattributed(&session, &file(), 30, Some("router rework"), NOW).unwrap();
+        store.attribute_claims("claude:s1", "a1", &file(), NOW).unwrap();
+
+        // a2's own csm_claim on the file only extends a1's claim, and a2 hears so.
+        store.claim_files_unattributed(&session, &file(), 30, None, NOW).unwrap();
+        let kept = store.attribute_claims("claude:s1", "a2", &file(), NOW).unwrap();
+        let told = kept_claims_notice(&kept, P, NOW).expect("a notice");
+        assert!(told.starts_with("csm: src/main.rs is claimed by another subagent working for the same session"));
+        assert!(told.ends_with("\"router rework\". Your csm_claim did not make it yours."), "{told}");
 
         let text = collision_notice(&store, Host::Claude, "s1", "a2", P, &file(), NOW).unwrap().expect("a warning");
         assert!(
