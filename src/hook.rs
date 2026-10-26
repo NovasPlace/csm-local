@@ -855,6 +855,36 @@ mod tests {
     }
 
     #[test]
+    fn parallel_subagents_of_one_session_are_warned_about_each_other() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = 1_791_900_000_000;
+        let prompt =
+            json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": DIR, "prompt": "fan out" });
+        send(&store, Host::Claude, prompt, t0);
+        let by = |agent: &str, event: &str| {
+            let mut payload = edit("s1", "Edit", event, "src/x.rs");
+            if !agent.is_empty() {
+                payload["agent_id"] = json!(agent);
+                payload["tool_use_id"] = json!(format!("{agent}-{event}"));
+            }
+            payload
+        };
+        assert!(send(&store, Host::Claude, by("a1", "PreToolUse"), t0 + 1).is_none());
+        send(&store, Host::Claude, by("a1", "PostToolUse"), t0 + 2);
+
+        let out = send(&store, Host::Claude, by("a2", "PreToolUse"), t0 + 120_000).expect("a sibling warning");
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let text = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(
+            text.starts_with("csm: src/x.rs was edited 1m ago by another subagent working for the same session."),
+            "{text}"
+        );
+        assert!(!text.contains("csm_send"), "{text}");
+        assert!(send(&store, Host::Claude, by("a2", "PreToolUse"), t0 + 121_000).is_none(), "said once");
+        assert!(send(&store, Host::Claude, by("", "PreToolUse"), t0 + 122_000).is_none(), "the parent handed it out");
+    }
+
+    #[test]
     fn skips_events_it_cannot_attribute() {
         let store = Store::open_in_memory().unwrap();
         for payload in [

@@ -1,5 +1,6 @@
 //! Collision warnings: before an agent edits a file, tell it when another
-//! session that is still running edited the same file recently. Nothing is
+//! session that is still running edited the same file recently, or, for a
+//! subagent, when another subagent of the same session did. Nothing is
 //! locked or blocked; the agent decides what to do with the information.
 //!
 //! Hooks record every successful edit's absolute path in `file_touches`.
@@ -33,13 +34,16 @@ pub fn touch_key(path: &str) -> String {
     }
 }
 
-/// The newest edit of one file by one other session.
+/// The newest edit of one file by one other session, or by one sibling
+/// subagent of the asking one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Touch {
     pub display: String,
     pub project: String,
     pub host: String,
     pub session_id: String,
+    /// The sibling subagent that made the edit; empty for another session.
+    pub agent_id: String,
     pub ts: i64,
 }
 
@@ -102,22 +106,35 @@ CREATE TABLE IF NOT EXISTS csm_project_links (
     }
 
     /// For each path, the newest edit since `since` by every session other
-    /// than (`host`, `session_id`). Newest first.
-    pub fn recent_touches(&self, paths: &[String], host: &str, session_id: &str, since: i64) -> Result<Vec<Touch>> {
+    /// than (`host`, `session_id`), and, when `agent_id` is a subagent, by each
+    /// of its siblings. Edits between a session and its own subagents never
+    /// count: the session handed that work out. Newest first.
+    pub fn recent_touches(
+        &self,
+        paths: &[String],
+        host: &str,
+        session_id: &str,
+        agent_id: &str,
+        since: i64,
+    ) -> Result<Vec<Touch>> {
         let mut stmt = self.conn.prepare(
-            "SELECT display, project, host, session_id, MAX(ts) FROM csm_file_touches
-             WHERE path = ?1 AND ts >= ?2 AND NOT (host = ?3 AND session_id = ?4)
-             GROUP BY host, session_id",
+            "SELECT display, project, host, session_id,
+                    CASE WHEN host = ?3 AND session_id = ?4 THEN agent_id ELSE '' END AS sibling, MAX(ts)
+             FROM csm_file_touches
+             WHERE path = ?1 AND ts >= ?2
+               AND NOT (host = ?3 AND session_id = ?4 AND (?5 = '' OR agent_id IN ('', ?5)))
+             GROUP BY host, session_id, sibling",
         )?;
         let mut touches = Vec::new();
         for path in paths {
-            let rows = stmt.query_map(params![touch_key(path), since, host, session_id], |r| {
+            let rows = stmt.query_map(params![touch_key(path), since, host, session_id, agent_id], |r| {
                 Ok(Touch {
                     display: r.get(0)?,
                     project: r.get(1)?,
                     host: r.get(2)?,
                     session_id: r.get(3)?,
-                    ts: r.get(4)?,
+                    agent_id: r.get(4)?,
+                    ts: r.get(5)?,
                 })
             })?;
             touches.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
@@ -132,9 +149,10 @@ CREATE TABLE IF NOT EXISTS csm_project_links (
 }
 
 /// The warning for a session about to edit `paths`, if another session has
-/// claimed any of them, or another running session edited any of them
-/// within the lease window. Each claim, and each (file, other session) edit,
-/// is reported once, so repeated edits stay quiet.
+/// claimed any of them, or another running session, or a sibling subagent,
+/// edited any of them within the lease window. Each claim, and each (file,
+/// other session or sibling) edit, is reported once, so repeated edits stay
+/// quiet.
 pub fn collision_notice(
     store: &Store,
     host: Host,
@@ -161,32 +179,35 @@ pub fn collision_notice(
         }
     }
     let mut lines = Vec::new();
-    for touch in store.recent_touches(paths, host.name(), session_id, now - LEASE_WINDOW_MS)? {
+    for touch in store.recent_touches(paths, host.name(), session_id, agent_id, now - LEASE_WINDOW_MS)? {
         if lines.len() == MAX_FILES_NAMED {
             break;
         }
-        if !store.session_live(&touch.project, &touch.host, &touch.session_id, now, LEASE_WINDOW_MS)? {
+        // A sibling works inside the asking session, which is running.
+        let sibling = !touch.agent_id.is_empty();
+        if !sibling && !store.session_live(&touch.project, &touch.host, &touch.session_id, now, LEASE_WINDOW_MS)? {
             continue;
         }
         let file = rel_path(&[project.to_string()], project, &touch.display);
-        let line = format!(
-            "{file} was edited {} by another session that is still running ({}).",
-            ago(now, touch.ts),
-            who(store, &touch)?
-        );
+        let by = if sibling {
+            "another subagent working for the same session".to_string()
+        } else {
+            format!("another session that is still running ({})", who(store, &touch)?)
+        };
+        let line = format!("{file} was edited {} by {by}.", ago(now, touch.ts));
         // Keyed by the other session's edit itself: the same edit is reported
         // once, and a newer edit to the same file is reported again.
-        let trigger = format!(
-            "lease:{}:{}:{}:{}",
-            content_hash(&touch_key(&touch.display)),
-            touch.host,
-            touch.session_id,
-            touch.ts
-        );
+        let editor =
+            if sibling { format!("{}/{}", touch.session_id, touch.agent_id) } else { touch.session_id.clone() };
+        let trigger =
+            format!("lease:{}:{}:{editor}:{}", content_hash(&touch_key(&touch.display)), touch.host, touch.ts);
         let claimed =
             store.claim_injection(project, host.name(), session_id, agent_id, &trigger, None, &line, &[], now)?;
         if claimed {
-            sources.push(format!("{}:{}", touch.host, touch.session_id));
+            // A sibling has no address of its own; its session is the asker's.
+            if !sibling {
+                sources.push(format!("{}:{}", touch.host, touch.session_id));
+            }
             lines.push(line);
         }
     }
@@ -320,6 +341,43 @@ mod tests {
         active(&store, "codex", "old", "z", NOW - 50 * MIN);
         store.touch_files(P, "codex", "old", "", &file(), NOW - 45 * MIN).unwrap();
         assert!(collision_notice(&store, Host::Claude, "me", "", P, &file(), NOW).unwrap().is_none(), "too old");
+    }
+
+    #[test]
+    fn a_subagent_is_warned_about_its_siblings_edits_only() {
+        let store = Store::open_in_memory().unwrap();
+        active(&store, "claude", "s1", "split the work", NOW - 5 * MIN);
+        store.register_peer(P, "claude", "s1", None, "active", NOW - 5 * MIN).unwrap();
+        store.touch_files(P, "claude", "s1", "a1", &file(), NOW - 2 * MIN).unwrap();
+
+        let text = collision_notice(&store, Host::Claude, "s1", "a2", P, &file(), NOW).unwrap().expect("a warning");
+        assert_eq!(
+            text,
+            "csm: src/main.rs was edited 2m ago by another subagent working for the same session. Those changes may not be in the copy of the file you read."
+        );
+        assert!(collision_notice(&store, Host::Claude, "s1", "a2", P, &file(), NOW).unwrap().is_none(), "said once");
+        assert!(collision_notice(&store, Host::Claude, "s1", "a1", P, &file(), NOW).unwrap().is_none(), "own edit");
+        assert!(collision_notice(&store, Host::Claude, "s1", "", P, &file(), NOW).unwrap().is_none(), "handed out");
+        store.touch_files(P, "claude", "s1", "a1", &file(), NOW + MIN).unwrap();
+        assert!(collision_notice(&store, Host::Claude, "s1", "a2", P, &file(), NOW + 2 * MIN).unwrap().is_some());
+
+        // The parent's own edits are not a sibling's.
+        let other = vec!["C:/work/app/src/lib.rs".to_string()];
+        store.touch_files(P, "claude", "s1", "", &other, NOW).unwrap();
+        assert!(collision_notice(&store, Host::Claude, "s1", "a3", P, &other, NOW + MIN).unwrap().is_none());
+    }
+
+    #[test]
+    fn another_sessions_subagents_count_as_that_session_once() {
+        let store = Store::open_in_memory().unwrap();
+        active(&store, "codex", "other", "fan out", NOW - 5 * MIN);
+        store.touch_files(P, "codex", "other", "x1", &file(), NOW - 3 * MIN).unwrap();
+        store.touch_files(P, "codex", "other", "x2", &file(), NOW - 2 * MIN).unwrap();
+        for agent in ["", "a1"] {
+            let text = collision_notice(&store, Host::Claude, "me", agent, P, &file(), NOW).unwrap().unwrap();
+            assert_eq!(text.matches("was edited").count(), 1, "{text}");
+            assert!(text.contains("2m ago by another session that is still running (via codex in app"), "{text}");
+        }
     }
 
     #[test]
