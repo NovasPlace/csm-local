@@ -105,3 +105,61 @@ fn wake_status_never_contains_private_routes_or_binding_tokens() {
     assert!(!text.contains(&s.peer_binding_token("codex:receiver").unwrap()));
     assert!(s.register_codex_route("codex:receiver", "https://remote.example", now()).is_err());
 }
+
+/// On Windows a child outlives its parent: a wake-hook left behind by a host
+/// that quit would wait out its timeout holding the session's lease, and take
+/// the wake meant for the session when it resumes.
+#[cfg(windows)]
+#[test]
+fn a_wake_hook_waits_while_its_parent_runs_and_stops_when_it_is_gone() {
+    use std::io::{BufRead, BufReader};
+    use std::time::Instant;
+    let root = std::env::temp_dir().join(format!("csm-wake-orphan-{}-{}", std::process::id(), now()));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("mail.db");
+    let s = Store::open(&db).unwrap();
+    s.register_peer("C:/qa", "claude", "orphan", None, "idle", now()).unwrap();
+    s.set_wake_enabled(true).unwrap();
+    let payload = root.join("payload.json");
+    std::fs::write(&payload, json!({"session_id":"orphan","hook_event_name":"Stop"}).to_string()).unwrap();
+    let quoted = |p: &std::path::Path| p.display().to_string().replace('\'', "''");
+    // The parent starts the hook the way a shell would, says its process id,
+    // stays three seconds, and exits without waiting for it.
+    let script = format!(
+        "$p = Start-Process -FilePath '{}' -ArgumentList '--db \"{}\" wake-hook claude --timeout-seconds 60' \
+         -RedirectStandardInput '{}' -NoNewWindow -PassThru; $p.Id; Start-Sleep -Seconds 3",
+        quoted(std::path::Path::new(env!("CARGO_BIN_EXE_csm"))),
+        quoted(&db),
+        quoted(&payload)
+    );
+    let mut parent = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(parent.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let pid: u32 = line.trim().parse().unwrap_or_else(|_| panic!("no process id from the parent: {line:?}"));
+    let running = || {
+        let filter = format!("PID eq {pid}");
+        let out = Command::new("tasklist").args(["/FI", &filter, "/NH", "/FO", "CSV"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains("csm.exe")
+    };
+
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(running(), "the hook waits while its parent runs");
+    assert!(s.watcher_alive("claude:orphan", now()).unwrap(), "holding the session's lease");
+    assert!(parent.wait().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let outlived = running();
+    if outlived {
+        let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).output();
+    }
+    assert!(!outlived, "wake-hook {pid} outlived its parent");
+    assert!(!s.watcher_alive("claude:orphan", now()).unwrap(), "and gave the lease up");
+    drop(s);
+    let _ = std::fs::remove_dir_all(root);
+}
