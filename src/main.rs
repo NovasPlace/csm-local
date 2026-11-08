@@ -105,10 +105,10 @@ enum Command {
     /// Record where the work stands, for the next session
     Checkpoint {
         summary: String,
-        /// A next step (repeatable)
+        /// A next step (repeatable, up to 5, each up to 180 bytes)
         #[arg(long)]
         next: Vec<String>,
-        /// A blocker (repeatable)
+        /// A blocker (repeatable, up to 5, each up to 180 bytes)
         #[arg(long)]
         blocker: Vec<String>,
         /// Set the project's goal

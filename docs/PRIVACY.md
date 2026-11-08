@@ -37,8 +37,17 @@ writes, or checkpoint content. Disable/uninstall the CSM hooks to stop automatic
 capture entirely. Desktop apps may require a full exit and relaunch to inherit
 changed environment settings.
 
+When the user types a request, CSM can show the agent up to three earlier
+requests from other sessions in the same project that share its rarer words,
+with the reply each got and what the user said next, once per session. That text
+goes to the agent's model provider like a briefing. When a reply reports a
+result after an unrun code change, or one like a result the user pushed back on,
+CSM sends the agent back once to say what it verified. Set `CSM_RECALL=0` or
+`CSM_CLAIM_CHECK=0` in the agent's environment to turn either off.
+
 Automatic journal records are pruned in bounded batches during session starts
-using 90-day and 5,000-event-per-project thresholds. This does not guarantee
+using 90-day and 5,000-event-per-project thresholds; requests and replies age
+out at 90 days and do not count toward the 5,000. This does not guarantee
 immediate deletion at a fixed age. Saved memories and agent-authored goals/checkpoints
 are retained until explicitly deleted. App-generated suggestion sessions remain
 in raw records but are filtered from briefings when their identifying prompts

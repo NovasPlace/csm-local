@@ -10,7 +10,6 @@ use rusqlite::params;
 
 use crate::capture::{normalize, rel_path, Host};
 use crate::claims::{self, Claim};
-use crate::journal::EventQuery;
 use crate::store::{content_hash, Store};
 use crate::text::{one_line, truncate};
 use crate::time::ago;
@@ -271,15 +270,8 @@ fn who(store: &Store, touch: &Touch) -> Result<String> {
             parts.push(format!("working on \"{}\"", truncate(&one_line(&peer.label), 80)));
         }
     }
-    let prompt = store.events(&EventQuery {
-        project: Some(&touch.project),
-        session_id: Some(&touch.session_id),
-        kinds: &["prompt"],
-        limit: 20,
-        ..Default::default()
-    })?;
-    if let Some(p) = prompt.iter().find(|p| crate::brief::is_typed_prompt(&p.summary)) {
-        parts.push(format!("last request: \"{}\"", truncate(&one_line(&p.summary), 120)));
+    if let Some((asked, _)) = crate::recall::last_request(store, &touch.host, &touch.session_id)? {
+        parts.push(format!("last request: \"{}\"", truncate(&asked, 120)));
     }
     Ok(parts.join(", "))
 }

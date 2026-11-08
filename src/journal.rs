@@ -141,6 +141,10 @@ const EXCLUDE_SUGGESTION_SESSIONS: &str = "
         HAVING MIN(instr(prompt.summary, 'This is an app-generated request for a suggested next user message. The user did not write this message.') = 1) = 1
     )";
 
+/// The start of every Codex app request for a suggested next message.
+pub(crate) const SUGGESTION_PREAMBLE: &str =
+    "This is an app-generated request for a suggested next user message. The user did not write this message.";
+
 fn suggestion_filter(exclude: bool) -> &'static str {
     if exclude {
         EXCLUDE_SUGGESTION_SESSIONS
@@ -279,6 +283,27 @@ impl Store {
 
     pub fn latest_event(&self, project: &str, kinds: &[&str]) -> Result<Option<Event>> {
         Ok(self.events(&EventQuery { project: Some(project), kinds, limit: 1, ..Default::default() })?.pop())
+    }
+
+    /// The main agent's requests and replies in one session next to event
+    /// `id`: up to `limit` before it, newest first, or after it, oldest first.
+    pub fn conversation_near(
+        &self,
+        host: &str,
+        session_id: &str,
+        id: i64,
+        after: bool,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let (side, order) = if after { (">", "ASC") } else { ("<", "DESC") };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events
+             WHERE session_id = ?1 AND host = ?2 AND agent_id = '' AND kind IN ('prompt', 'turn_end') AND id {side} ?3
+             ORDER BY id {order}
+             LIMIT ?4"
+        ))?;
+        let rows = stmt.query_map(params![session_id, host, id, limit as i64], row_to_event)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// The most recently active session in `project` other than `exclude`,
@@ -439,21 +464,24 @@ impl Store {
         Ok(true)
     }
 
-    /// Size of the most recent injection, for `csm status`.
+    /// Size of the most recent briefing injection, for `csm status`.
     pub fn last_injection(&self) -> Result<Option<(String, i64, i64)>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT host, bytes, ts FROM injections WHERE trigger NOT LIKE 'lease:%' ORDER BY id DESC LIMIT 1",
+                "SELECT host, bytes, ts FROM injections
+                 WHERE trigger NOT LIKE 'lease:%' AND trigger NOT LIKE 'recall:%' AND trigger NOT LIKE 'claim:%'
+                 ORDER BY id DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?)
     }
 
-    /// Ages out hook-recorded events: anything older than [`KEEP_DAYS`] and
-    /// anything beyond the newest [`KEEP_EVENTS_PER_PROJECT`]. Bounded per
-    /// call so it never stalls a hook.
+    /// Ages out hook-recorded events: anything older than [`KEEP_DAYS`] and,
+    /// except the user's requests and the replies to them, anything beyond
+    /// the newest [`KEEP_EVENTS_PER_PROJECT`]. Bounded per call so it never
+    /// stalls a hook.
     pub fn prune_events(&self, project: &str, now: i64) -> Result<usize> {
         let cutoff = now - KEEP_DAYS * DAY_MS;
         let n = self.conn.execute(
@@ -461,8 +489,9 @@ impl Store {
                 "DELETE FROM events WHERE id IN (
                      SELECT id FROM events
                      WHERE project = ?1 AND kind IN ({PRUNABLE_KINDS})
-                       AND (ts < ?2 OR id <= (SELECT id FROM events WHERE project = ?1
-                                              ORDER BY id DESC LIMIT 1 OFFSET ?3))
+                       AND (ts < ?2 OR (kind NOT IN ('prompt', 'turn_end')
+                                        AND id <= (SELECT id FROM events WHERE project = ?1
+                                                   ORDER BY id DESC LIMIT 1 OFFSET ?3)))
                      ORDER BY id LIMIT ?4)"
             ),
             params![project, cutoff, KEEP_EVENTS_PER_PROJECT, PRUNE_BATCH],
@@ -489,6 +518,23 @@ impl Store {
                 "goal is {} bytes, over the {MAX_GOAL_BYTES}-byte limit; nothing was recorded",
                 goal.len()
             )));
+        }
+        for (label, items) in [("next step", &c.next), ("blocker", &c.blockers)] {
+            let items: Vec<String> = items.iter().map(|i| one_line(i)).filter(|i| !i.is_empty()).collect();
+            if items.len() > MAX_ITEMS {
+                return Err(Error::Invalid(format!(
+                    "{} {label}s, over the limit of {MAX_ITEMS}; nothing was recorded. Merge or drop some and send it again",
+                    items.len()
+                )));
+            }
+            if let Some(long) = items.iter().find(|i| i.len() > MAX_ITEM_BYTES) {
+                return Err(Error::Invalid(format!(
+                    "a {label} is {} bytes, over the {MAX_ITEM_BYTES}-byte limit; nothing was recorded. \
+                     Shorten \"{}\" and send it again",
+                    long.len(),
+                    truncate(long, 60)
+                )));
+            }
         }
         let now = now_ms();
         let event = |kind: &str, summary: String, detail: Option<String>| NewEvent {
@@ -672,22 +718,32 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_keeps_blockers_within_the_detail_cap() {
+    fn checkpoint_items_that_do_not_fit_are_refused_not_cut() {
         let store = Store::open_in_memory().unwrap();
-        let long = |label: &str| (0..5).map(|i| format!("{label} {i} {}", "z".repeat(400))).collect::<Vec<_>>();
-        store
-            .checkpoint(Checkpoint {
+        let items = |label: &str, n: usize, bytes: usize| {
+            (0..n).map(|i| format!("{label} {i} {}", "z".repeat(bytes - label.len() - 3))).collect::<Vec<_>>()
+        };
+        let cp = |next: Vec<String>, blockers: Vec<String>| {
+            store.checkpoint(Checkpoint {
                 project: P.into(),
                 host: "mcp".into(),
                 summary: "s".into(),
-                next: long("next"),
-                blockers: long("blocker"),
+                next,
+                blockers,
                 ..Default::default()
             })
-            .unwrap();
+        };
+        let err = cp(items("next", 6, 20), vec![]).unwrap_err().to_string();
+        assert!(err.starts_with("6 next steps, over the limit of 5; nothing was recorded."), "{err}");
+        let err = cp(vec![], items("blocker", 1, MAX_ITEM_BYTES + 1)).unwrap_err().to_string();
+        assert!(err.starts_with("a blocker is 181 bytes, over the 180-byte limit; nothing was recorded."), "{err}");
+        assert!(store.latest_event(P, &["checkpoint"]).unwrap().is_none());
+
+        cp(items("next", 5, MAX_ITEM_BYTES), items("blocker", 5, MAX_ITEM_BYTES)).unwrap();
         let detail = store.latest_event(P, &["checkpoint"]).unwrap().unwrap().detail.unwrap();
         assert_eq!(detail.lines().filter(|l| l.starts_with("blocker: ")).count(), 5, "{detail}");
         assert_eq!(detail.lines().filter(|l| l.starts_with("next: ")).count(), 5, "{detail}");
+        assert!(detail.len() <= MAX_DETAIL_BYTES, "{}", detail.len());
     }
 
     #[test]
@@ -729,6 +785,23 @@ mod tests {
         }
         assert_eq!(store.prune_events(P, 2_000_000).unwrap(), 10);
         assert_eq!(store.stats(Some(P)).unwrap().events, KEEP_EVENTS_PER_PROJECT);
+    }
+
+    #[test]
+    fn requests_and_replies_outlast_the_event_cap() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_at(ev("prompt", "s1", "make the legs run"), 1_000).unwrap();
+        store.record_at(ev("turn_end", "s1", "fixed the legs"), 1_001).unwrap();
+        for i in 0..KEEP_EVENTS_PER_PROJECT {
+            store.record_at(ev("command", "s1", &format!("c{i}")), 2_000 + i).unwrap();
+        }
+        assert_eq!(store.prune_events(P, 2_000_000).unwrap(), 0, "within the cap, not counting them");
+        store.record_at(ev("command", "s1", "one more"), 9_000).unwrap();
+        assert_eq!(store.prune_events(P, 2_000_000).unwrap(), 1, "the oldest command");
+        let kept = |kind| store.events(&EventQuery { kinds: &[kind], limit: 10, ..Default::default() }).unwrap().len();
+        assert_eq!((kept("prompt"), kept("turn_end")), (1, 1));
+        assert_eq!(store.prune_events(P, 1_000 + KEEP_DAYS * DAY_MS + 1).unwrap(), 1, "until they are 90 days old");
+        assert_eq!(kept("prompt"), 0);
     }
 
     #[test]

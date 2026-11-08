@@ -13,7 +13,7 @@ use crate::journal::{Event, EventQuery, SessionInfo, MAX_CHECKPOINT_BYTES, MAX_G
 use crate::store::Store;
 use crate::text::{one_line, tail, truncate};
 use crate::time::{ago, iso};
-use crate::{decisions, Result};
+use crate::{decisions, recall, Result};
 
 pub const DEFAULT_BUDGET: usize = 4_000;
 pub const MIN_BUDGET: usize = 1_000;
@@ -25,6 +25,8 @@ const DAY_MS: i64 = 86_400_000;
 const ACTIVE_WINDOW_MS: i64 = 30 * 60_000;
 const CHECKPOINT_MAX_AGE_MS: i64 = 30 * DAY_MS;
 const PROBLEM_MAX_AGE_MS: i64 = 7 * DAY_MS;
+const PUSHBACK_MAX_AGE_MS: i64 = 14 * DAY_MS;
+const MAX_PUSHBACKS: usize = 3;
 const RECENT_MAX_AGE_MS: i64 = 14 * DAY_MS;
 const MAX_SESSION_FILES: usize = 8;
 const MAX_SESSION_COMMANDS: usize = 4;
@@ -94,6 +96,7 @@ pub fn build(store: &Store, req: &BriefRequest) -> Result<Option<Briefing>> {
     sections.extend(board(store, req)?);
     sections.extend(checkpoint(store, req)?);
     sections.extend(problem(store, req)?);
+    sections.extend(pushed_back(store, req)?);
     let sessions = previous_session(store, req)?;
     sections.extend(sessions.live);
     sections.extend(claims(store, req)?);
@@ -220,6 +223,38 @@ fn checkpoint(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
         }
     }
     Ok(Some(Section { name: "checkpoint", priority: 0, protected: true, title: None, lines }))
+}
+
+/// Results reported in other sessions that the user answered with "not
+/// fixed" or the like, so the next attempt does not claim the same again.
+/// Protected: the newest one stays even when the board and the checkpoint
+/// fill the budget, and the others are the first protected lines to go.
+fn pushed_back(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
+    let lines: Vec<Line> = recall::pushbacks(store, req.project, req.now - PUSHBACK_MAX_AGE_MS)?
+        .into_iter()
+        .filter(|p| req.current_session != Some(p.session_id.as_str()))
+        .take(MAX_PUSHBACKS)
+        .map(|p| {
+            let line = format!(
+                "  {} via {}: \"{}\"; the user: \"{}\"",
+                ago(req.now, p.ts),
+                p.host,
+                clean(&p.claim, 160),
+                clean(&p.words, 120)
+            );
+            Line::new(line, Some(format!("event:{}", p.id)))
+        })
+        .collect();
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Section {
+        name: "pushback",
+        priority: 0,
+        protected: true,
+        title: Some("Results the user said were not so (check before reporting the same again):".into()),
+        lines,
+    }))
 }
 
 /// The newest failed command or test that has not since been run again
@@ -913,6 +948,61 @@ mod tests {
         let b = build(&store, &req(Some("old"))).unwrap().unwrap();
         assert!(!b.text.contains("Last request: \"add the parser tests\""), "{}", b.text);
         assert!(b.text.contains("Previous session (via claude"), "{}", b.text);
+    }
+
+    #[test]
+    fn a_result_the_user_pushed_back_on_is_briefed_to_other_sessions() {
+        let store = Store::open_in_memory().unwrap();
+        let at = |m: i64| NOW - m * MIN;
+        store.record_at(ev("prompt", "claude", "s1", "the running legs need love"), at(90)).unwrap();
+        store.record_at(ev("turn_end", "claude", "s1", "Fixed the running legs. Knees bend now."), at(80)).unwrap();
+        store.record_at(ev("prompt", "claude", "s1", "LOL not fixed"), at(70)).unwrap();
+        let b = build(&store, &req(Some("s2"))).unwrap().unwrap();
+        assert!(
+            b.text.contains(
+                "Results the user said were not so (check before reporting the same again):\n  1h ago via claude: \
+                 \"Fixed the running legs\"; the user: \"LOL not fixed\""
+            ),
+            "{}",
+            b.text
+        );
+        let own = build(&store, &req(Some("s1"))).unwrap();
+        assert!(own.is_none_or(|b| !b.text.contains("not so")), "the session it happened in knows");
+    }
+
+    #[test]
+    fn the_newest_pushback_survives_a_full_board_and_checkpoint() {
+        let store = Store::open_in_memory().unwrap();
+        seed(&store);
+        let at = |m: i64| NOW - m * MIN;
+        for (i, legs) in ["legs", "knees", "hips"].iter().enumerate() {
+            let session = format!("p{i}");
+            let ask = format!("the running {legs} need love");
+            store.record_at(ev("prompt", "claude", &session, &ask), at(90 - i as i64 * 3)).unwrap();
+            let fixed = format!("Fixed the running {legs}. They bend now.");
+            store.record_at(ev("turn_end", "claude", &session, &fixed), at(89 - i as i64 * 3)).unwrap();
+            store.record_at(ev("prompt", "claude", &session, "LOL not fixed"), at(88 - i as i64 * 3)).unwrap();
+        }
+        for i in 0..decisions::MAX_SHOWN {
+            let text = format!("decision {i} {}", "d".repeat(decisions::MAX_DECISION_BYTES - 12));
+            store.decide(P, Some(&text), None, "claude:6e36f6c2-0000-4000-8000-000000000000", NOW - MIN).unwrap();
+        }
+        store
+            .checkpoint(Checkpoint {
+                project: P.into(),
+                host: "mcp".into(),
+                summary: "handoff ".repeat((MAX_CHECKPOINT_BYTES - 8) / 8),
+                next: vec!["run the War".into(), "then the legs".into()],
+                goal: Some("g".repeat(100)),
+                ..Default::default()
+            })
+            .unwrap();
+        let b = build(&store, &BriefRequest { now: NOW, ..req(Some("s9")) }).unwrap().unwrap();
+        assert!(b.text.len() <= DEFAULT_BUDGET, "{}", b.text.len());
+        assert!(b.text.contains("Results the user said were not so"), "{}", b.text);
+        assert!(b.text.contains("\"Fixed the running hips\"; the user: \"LOL not fixed\""), "newest: {}", b.text);
+        assert!(!b.text.contains("running legs\""), "older ones give way first: {}", b.text);
+        assert!(b.text.contains("decision 0 "), "{}", b.text);
     }
 
     #[test]

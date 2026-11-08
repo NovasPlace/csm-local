@@ -3,7 +3,8 @@
 //!
 //! A hook must never get in the host's way. This one always exits 0, prints
 //! nothing except context payloads, and writes failures to a small log file
-//! instead of stderr. Opt-in messaging can continue a Stop once for new mail.
+//! instead of stderr. Opt-in messaging can continue a Stop once for new mail,
+//! and the claim check once for a reported result nothing backs up.
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -22,7 +23,7 @@ use crate::redact::redact;
 use crate::store::{content_hash, Store};
 use crate::text::{one_line, truncate};
 use crate::time::{iso, now_ms};
-use crate::{decisions, leases, paths, project, Error, Result};
+use crate::{decisions, leases, paths, project, recall, Error, Result};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_PROMPT_BYTES: usize = 300;
@@ -43,21 +44,29 @@ pub struct HookEnv {
     /// Explicit opt-in from `csm hook HOST --messaging`.
     pub messaging: bool,
     pub codex_app_pipe: Option<String>,
+    /// Whether a reply that reports a result can be sent back once to say
+    /// what was verified (`CSM_CLAIM_CHECK=0` turns it off).
+    pub claim_check: bool,
+    /// Whether a typed request is shown related earlier requests
+    /// (`CSM_RECALL=0` turns it off).
+    pub recall: bool,
 }
 
 impl HookEnv {
     pub fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let off = |name: &str| {
+            matches!(var(name).map(|v| v.to_ascii_lowercase()).as_deref(), Some("0" | "false" | "off" | "no"))
+        };
         HookEnv {
             project_dir: var("CLAUDE_PROJECT_DIR"),
-            capture_text: !matches!(
-                var("CSM_CAPTURE_TEXT").map(|v| v.to_ascii_lowercase()).as_deref(),
-                Some("0" | "false" | "off" | "no")
-            ),
+            capture_text: !off("CSM_CAPTURE_TEXT"),
             budget: var("CSM_BRIEF_BYTES").and_then(|v| v.parse().ok()).unwrap_or(brief::DEFAULT_BUDGET),
             now: now_ms(),
             messaging: false,
             codex_app_pipe: var("CODEX_APP_TOOLS_PIPE_PATH"),
+            claim_check: !off("CSM_CLAIM_CHECK"),
+            recall: !off("CSM_RECALL"),
         }
     }
 }
@@ -155,9 +164,22 @@ pub fn handle(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> Resu
         (Some(journal), Some(inbox)) => {
             let mut first: Value = serde_json::from_str(&journal).map_err(|e| Error::Invalid(e.to_string()))?;
             let second: Value = serde_json::from_str(&inbox).map_err(|e| Error::Invalid(e.to_string()))?;
-            let context = first["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
-            let mail = second["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
-            first["hookSpecificOutput"]["additionalContext"] = Value::String(format!("{context}\n\n{mail}"));
+            // A Stop is continued with a reason; anything else gets context.
+            let text = |v: &Value| {
+                v.get("reason")
+                    .or(v.pointer("/hookSpecificOutput/additionalContext"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            let (Some(own), Some(mail)) = (text(&first), text(&second)) else {
+                return Ok(Some(inbox));
+            };
+            let merged = Value::String(format!("{own}\n\n{mail}"));
+            if first.get("reason").is_some() {
+                first["reason"] = merged;
+            } else {
+                first["hookSpecificOutput"]["additionalContext"] = merged;
+            }
             Ok(Some(first.to_string()))
         }
         (Some(out), None) | (None, Some(out)) => Ok(Some(out)),
@@ -339,7 +361,21 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             if let Some(dedup_key) = turn_key(store, host, session_id, &agent_id, "prompt", turn, field("prompt"))? {
                 store.record_at(NewEvent { kind: "prompt".into(), summary, dedup_key, ..base }, env.now)?;
             }
-            board_context(store, host, session_id, &agent_id, &project, event_name, env)
+            let mut notices: Vec<String> =
+                decisions::board_notice(store, host.name(), session_id, &agent_id, &project, env.now)?
+                    .into_iter()
+                    .collect();
+            // Only what the user typed is looked up, and a failed lookup must
+            // not cost the board notice.
+            let typed = field("prompt")
+                .filter(|p| env.recall && env.capture_text && agent_id.is_empty() && brief::is_typed_prompt(p));
+            if let Some(prompt) = typed {
+                match recall::earlier_requests(store, host.name(), session_id, &project, prompt, env.now) {
+                    Ok(recalled) => notices.extend(recalled),
+                    Err(e) => log_failure(host.name(), &e.to_string()),
+                }
+            }
+            Ok(context(event_name, &notices))
         }
         "PostToolUse" | "PostToolUseFailure" => {
             let mut roots = vec![project.clone()];
@@ -407,8 +443,8 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             let notices: Vec<String> = collision.into_iter().chain(board).collect();
             Ok(context(event_name, &notices))
         }
-        // csm never blocks a Stop, so `stop_hook_active` (another hook made
-        // the turn continue) is just one more reply, and the latest wins.
+        // A reply after `stop_hook_active` (a hook made the turn continue) is
+        // one more reply, and the latest wins.
         "Stop" | "SubagentStop" => {
             let summary = captured("last_assistant_message", MAX_REPLY_BYTES);
             let reply = field("last_assistant_message");
@@ -420,7 +456,21 @@ fn handle_journal(store: &Store, host: Host, payload: &Value, env: &HookEnv) -> 
             if event_name == "SubagentStop" && !agent_id.is_empty() {
                 store.pause_agent_claims(&peer, &agent_id, env.now)?;
             }
-            Ok(None)
+            // Only the main agent answers the user, and a turn already
+            // continued by a hook is not sent back again.
+            let continued = payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false);
+            let Some(reply) =
+                reply.filter(|_| env.claim_check && event_name == "Stop" && agent_id.is_empty() && !continued)
+            else {
+                return Ok(None);
+            };
+            match recall::claim_check(store, host.name(), session_id, &project, reply, env.now) {
+                Ok(reason) => Ok(reason.map(|reason| json!({ "decision": "block", "reason": reason }).to_string())),
+                Err(e) => {
+                    log_failure(host.name(), &e.to_string());
+                    Ok(None)
+                }
+            }
         }
         // A turn that ended without a normal Stop: Codex `Interrupt`, Claude
         // `StopFailure` (API error).
@@ -629,6 +679,8 @@ mod tests {
             now,
             messaging: false,
             codex_app_pipe: None,
+            claim_check: true,
+            recall: true,
         }
     }
 
@@ -1221,6 +1273,57 @@ mod tests {
         for key in ["\"decision\"", "\"permissionDecision\"", "\"continue\"", "\"systemMessage\"", "\"stopReason\""] {
             assert!(!out.contains(key), "{key} in {out}");
         }
+    }
+
+    #[test]
+    fn a_reply_claiming_an_unrun_change_is_sent_back_once() {
+        let store = Store::open_in_memory().unwrap();
+        let ask = |session: &str, text: &str| json!({ "hook_event_name": "UserPromptSubmit", "session_id": session, "cwd": DIR, "prompt": text });
+        let stop = |continued: bool| {
+            json!({ "hook_event_name": "Stop", "session_id": "s1", "cwd": DIR, "stop_hook_active": continued,
+                    "last_assistant_message": "Fixed: the parser now handles unicode." })
+        };
+        send(&store, Host::Claude, ask("s1", "make the parser handle unicode"), 1);
+        send(&store, Host::Claude, edit("s1", "Edit", "PostToolUse", "src/parser.rs"), 2);
+        assert!(send(&store, Host::Claude, stop(true), 3).is_none(), "a turn a hook already continued");
+        let mut sub = stop(false);
+        sub["hook_event_name"] = json!("SubagentStop");
+        sub["agent_id"] = json!("a1");
+        assert!(send(&store, Host::Claude, sub, 4).is_none(), "a subagent answers its parent");
+        let off = HookEnv { claim_check: false, ..env(5) };
+        assert!(handle(&store, Host::Claude, &stop(false), &off).unwrap().is_none(), "turned off");
+
+        let out: Value = serde_json::from_str(&send(&store, Host::Claude, stop(false), 6).expect("sent back")).unwrap();
+        assert_eq!(out["decision"], "block");
+        let reason = out["reason"].as_str().unwrap();
+        assert!(reason.contains("No command or test ran after the last change to parser.rs."), "{reason}");
+        assert!(send(&store, Host::Claude, stop(false), 7).is_none(), "once per request");
+        assert_eq!(events(&store).iter().filter(|e| e.kind == "turn_end").count(), 5, "every reply is still recorded");
+    }
+
+    #[test]
+    fn a_request_brings_back_related_ones_from_other_sessions() {
+        let store = Store::open_in_memory().unwrap();
+        let ask = |session: &str, text: &str| json!({ "hook_event_name": "UserPromptSubmit", "session_id": session, "cwd": DIR, "prompt": text });
+        for i in 0..60 {
+            send(&store, Host::Claude, ask(&format!("n{i}"), &format!("bump the version to 1.{i}")), 10 + i);
+        }
+        claude_session(&store, "s1", 100);
+        let out = send(&store, Host::Claude, ask("s2", "the parser chokes on unicode again"), 200).expect("context");
+        let out: Value = serde_json::from_str(&out).unwrap();
+        let text = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(text.starts_with("csm: earlier requests in this project that look related"), "{text}");
+        assert!(text.contains("claude session s1: \"make the parser handle unicode\""), "{text}");
+        assert!(text.contains("    Reply: \"Parser updated; parse_unicode still fails.\""), "{text}");
+        let mut sub = ask("s3", "the parser chokes on unicode");
+        sub["agent_id"] = json!("a1");
+        assert!(send(&store, Host::Claude, sub, 201).is_none(), "a subagent's prompt is its parent's words");
+        let same = "the parser chokes on unicode";
+        let off = HookEnv { capture_text: false, ..env(202) };
+        assert!(handle(&store, Host::Claude, &ask("s4", same), &off).unwrap().is_none(), "no text kept");
+        let off = HookEnv { recall: false, ..env(203) };
+        assert!(handle(&store, Host::Claude, &ask("s5", same), &off).unwrap().is_none(), "turned off");
+        assert!(send(&store, Host::Claude, ask("s6", same), 204).is_some(), "on by default");
     }
 
     #[test]

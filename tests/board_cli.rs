@@ -142,6 +142,9 @@ fn a_decision_told_to_one_session_reaches_the_others_and_claims_show_up() {
     let peers = replies[3]["peers"].as_array().unwrap();
     let claude = peers.iter().find(|p| p["id"] == "claude:c1").unwrap();
     assert_eq!(claude["claims"][0]["note"], "collision rework");
+    assert_eq!(claude["last_request"], Value::Null, "nothing asked yet");
+    let codex = peers.iter().find(|p| p["id"] == "codex:x1").unwrap();
+    assert_eq!(codex["last_request"], "find out why saves change");
 
     // Codex hears about the decision on its very next tool call, once.
     let tool = |id: &str, file: &str| {

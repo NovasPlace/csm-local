@@ -549,8 +549,8 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "summary": { "type": "string", "description": "What is done and the current state, up to 1,500 bytes. A longer summary is refused, not cut." },
-                    "next": { "type": "array", "items": { "type": "string" }, "description": "Next steps, most important first." },
-                    "blockers": { "type": "array", "items": { "type": "string" } },
+                    "next": { "type": "array", "items": { "type": "string" }, "description": "Next steps, most important first: up to 5, each up to 180 bytes. More or longer is refused, not cut." },
+                    "blockers": { "type": "array", "items": { "type": "string" }, "description": "Up to 5, each up to 180 bytes." },
                     "goal": { "type": "string", "description": "Set the project's current goal, up to 500 bytes." },
                     "goal_done": { "type": "boolean", "description": "Mark the current goal as done." },
                     "project": project

@@ -421,7 +421,9 @@ pub fn peers_json(
     let mut listed = Vec::new();
     for peer in peers {
         let held: Vec<Value> = claims.iter().filter(|c| c.peer == peer.id).map(|c| c.json(now)).collect();
+        let asked = crate::recall::last_request(store, &peer.host, &peer.session_id)?;
         let mut value = serde_json::to_value(&peer).map_err(|e| Error::Invalid(e.to_string()))?;
+        value["last_request"] = asked.map(|(text, _)| truncate(&text, 160)).into();
         value["claims"] = Value::Array(held);
         listed.push(value);
     }
