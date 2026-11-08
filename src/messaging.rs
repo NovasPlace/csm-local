@@ -15,6 +15,8 @@ use crate::{Error, Result};
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 pub const MAX_MAILBOX_BATCH: usize = 100;
 pub const PEER_STALE_MS: i64 = 10 * 60 * 1000;
+/// A session silent this long is listed only with the ended ones.
+pub const PEER_GONE_MS: i64 = 24 * 60 * 60 * 1000;
 const MINUTE_MS: i64 = 60 * 1000;
 const PEER_COLUMNS: &str = "id, project, host, session_id, label, state, last_seen";
 const MESSAGE_COLUMNS: &str =
@@ -201,16 +203,29 @@ INSERT OR IGNORE INTO csm_mailbox_meta(singleton, version) VALUES (1, 1);
         )?)
     }
 
-    /// Up to 100 most recently seen peers. By default excludes ended and stale
-    /// sessions; included stale sessions have state `stale` (ended stays ended).
-    pub fn peers(&self, project: Option<&str>, now: i64, include_stale: bool) -> Result<Vec<Peer>> {
+    /// Up to 100 most recently seen peers. By default only sessions seen in
+    /// the last [`PEER_STALE_MS`]; `include_stale` adds quiet ones, up to
+    /// [`PEER_GONE_MS`], and `include_ended` every other one, ended or long
+    /// silent. Quiet sessions have state `stale` (ended stays ended).
+    pub fn peers(
+        &self,
+        project: Option<&str>,
+        now: i64,
+        include_stale: bool,
+        include_ended: bool,
+    ) -> Result<Vec<Peer>> {
         validate_time(now)?;
         let cutoff = now.saturating_sub(PEER_STALE_MS);
+        let since = match (include_ended, include_stale) {
+            (true, _) => i64::MIN,
+            (false, true) => now.saturating_sub(PEER_GONE_MS),
+            (false, false) => cutoff,
+        };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {PEER_COLUMNS} FROM csm_peers WHERE (?1 IS NULL OR project = ?1)
-             AND (?2 OR (last_seen >= ?3 AND state != 'ended')) ORDER BY last_seen DESC, id LIMIT 100"
+             AND (?2 OR state != 'ended') AND last_seen >= ?3 ORDER BY last_seen DESC, id LIMIT 100"
         ))?;
-        let rows = stmt.query_map(params![project, include_stale, cutoff], row_to_peer)?;
+        let rows = stmt.query_map(params![project, include_ended, since], row_to_peer)?;
         let mut peers = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         for peer in &mut peers {
             if peer.last_seen < cutoff && peer.state != "ended" {

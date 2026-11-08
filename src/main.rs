@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use csm_local::brief::{self, BriefRequest};
 use csm_local::capture::absolute;
 use csm_local::claims::{self, peers_json};
-use csm_local::journal::{Checkpoint, EventQuery, EVENT_KINDS, MAX_HANDOFF_BYTES};
+use csm_local::journal::{Checkpoint, EventQuery, EVENT_KINDS};
 use csm_local::mcp::{inbox_json, message_json, wait_for_messages, Server};
 use csm_local::messaging::NewMessage;
 use csm_local::store::{Filter, NewMemory, Store};
@@ -164,8 +164,12 @@ enum Command {
         project: Option<PathBuf>,
         #[arg(long)]
         all_projects: bool,
+        /// Also list sessions quiet for over 10 minutes but heard from within the last day
         #[arg(long)]
         include_stale: bool,
+        /// Also list ended sessions and ones silent for over a day
+        #[arg(long)]
+        include_ended: bool,
     },
     /// Send addressed peer coordination with durable delivery, not human permission (JSON)
     Send {
@@ -584,9 +588,6 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Checkpoint { summary, next, blocker, goal, goal_done, project } => {
-            if summary.len() > MAX_HANDOFF_BYTES || goal.as_ref().is_some_and(|g| g.len() > MAX_HANDOFF_BYTES) {
-                eprintln!("Note: the summary and goal are kept to {MAX_HANDOFF_BYTES} bytes each.");
-            }
             let result = store.checkpoint(Checkpoint {
                 project: resolve_project(&store, project)?,
                 host: "cli".into(),
@@ -754,9 +755,10 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Peers { project, all_projects, include_stale } => {
+        Command::Peers { project, all_projects, include_stale, include_ended } => {
             let project = resolve_project(&store, project)?;
-            print_json(&peers_json(&store, (!all_projects).then_some(project.as_str()), now_ms(), include_stale)?);
+            let project = (!all_projects).then_some(project.as_str());
+            print_json(&peers_json(&store, project, now_ms(), include_stale, include_ended)?);
         }
         Command::Send { from, to, request_id, content, reply_to, allow_cross_project, ttl_seconds } => {
             require_peer(&store, &from)?;

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::capture::{absolute, rel_path};
 
-use crate::journal::{Event, EventQuery, SessionInfo, MAX_HANDOFF_BYTES};
+use crate::journal::{Event, EventQuery, SessionInfo, MAX_CHECKPOINT_BYTES, MAX_GOAL_BYTES};
 use crate::store::Store;
 use crate::text::{one_line, tail, truncate};
 use crate::time::{ago, iso};
@@ -33,6 +33,10 @@ const MAX_RECENT: usize = 6;
 const MAX_FOREIGN_SESSIONS: usize = 3;
 const MAX_FOREIGN_FILES: usize = 4;
 const MAX_CLAIMS: usize = 6;
+/// How far a long checkpoint summary can be cut when a briefing is short of
+/// room: what every checkpoint got before longer ones were kept.
+const SHORT_CHECKPOINT_BYTES: usize = 500;
+const SHORTENED: &str = " (shortened to fit; csm_brief shows all of it)";
 
 const INTRO: &str = "Notes recorded by csm during earlier sessions in this project. \
 They can be out of date; the files in the repository are the source of truth.";
@@ -62,11 +66,14 @@ pub struct Briefing {
 struct Line {
     text: String,
     source: Option<String>,
+    /// Once only protected sections are left to trim, this line is cut to
+    /// no fewer bytes than this before any protected line is dropped.
+    shrinks_to: Option<usize>,
 }
 
 impl Line {
     fn new(text: String, source: Option<String>) -> Self {
-        Line { text, source }
+        Line { text, source, shrinks_to: None }
     }
 }
 
@@ -122,7 +129,7 @@ fn goal(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
         protected: true,
         title: None,
         lines: vec![Line::new(
-            format!("Goal (set {} via {}): {}", ago(req.now, g.ts), g.host, clean(&g.summary, MAX_HANDOFF_BYTES)),
+            format!("Goal (set {} via {}): {}", ago(req.now, g.ts), g.host, clean(&g.summary, MAX_GOAL_BYTES)),
             source(&g),
         )],
     }))
@@ -199,10 +206,12 @@ fn checkpoint(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
     if req.now - c.ts > CHECKPOINT_MAX_AGE_MS {
         return Ok(None);
     }
-    let mut lines = vec![Line::new(
-        format!("Last checkpoint ({}, via {}): {}", ago(req.now, c.ts), c.host, clean(&c.summary, MAX_HANDOFF_BYTES)),
-        source(&c),
-    )];
+    let head = format!("Last checkpoint ({}, via {}): ", ago(req.now, c.ts), c.host);
+    let mut first = Line::new(format!("{head}{}", clean(&c.summary, MAX_CHECKPOINT_BYTES)), source(&c));
+    // A long handoff gives way before a standing decision does.
+    let floor = head.len() + SHORT_CHECKPOINT_BYTES;
+    first.shrinks_to = (first.text.len() > floor).then_some(floor);
+    let mut lines = vec![first];
     // Trimming drops lines from the end, so blockers go first.
     let detail = c.detail.as_deref().unwrap_or("");
     for (prefix, label) in [("blocker: ", "Blocker"), ("next: ", "Next")] {
@@ -635,16 +644,33 @@ fn is_absolute_path(path: &str) -> bool {
 fn render(req: &BriefRequest, mut sections: Vec<Section>, budget: usize) -> Briefing {
     let header = format!("<csm_briefing project=\"{}\" generated=\"{}\">", attr(req.project), iso(req.now));
     let mut dropped: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut shortened = Vec::new();
     loop {
         let text = compose(&header, &sections);
         if text.len() <= budget {
             let sources = sections.iter().flat_map(|s| &s.lines).filter_map(|l| l.source.clone()).collect();
-            let trimmed = dropped.iter().map(|(name, n)| format!("{name}:{n}")).collect();
+            let trimmed = dropped
+                .iter()
+                .map(|(name, n)| format!("{name}:{n}"))
+                .chain(shortened.iter().map(|name| format!("{name}:shortened")))
+                .collect();
             return Briefing { text, sources, trimmed };
         }
         // Least important first; protected sections only give up their
         // detail lines, and only once nothing else is left to trim.
         let has_unprotected = sections.iter().any(|s| !s.protected && !s.lines.is_empty());
+        if !has_unprotected {
+            let long = sections.iter_mut().find_map(|s| {
+                let name = s.name;
+                s.lines.iter_mut().find(|l| l.shrinks_to.is_some()).map(|l| (name, l))
+            });
+            if let Some((name, line)) = long {
+                let floor = line.shrinks_to.take().unwrap_or_default();
+                line.text = shorten(&line.text, text.len() - budget, floor);
+                shortened.push(name);
+                continue;
+            }
+        }
         let victim = if has_unprotected {
             sections.iter_mut().filter(|s| !s.protected && !s.lines.is_empty()).max_by_key(|s| s.priority)
         } else {
@@ -679,6 +705,12 @@ fn compose(header: &str, sections: &[Section]) -> String {
     out.push(OUTRO.to_string());
     out.push(CLOSE.to_string());
     out.join("\n")
+}
+
+/// `line` cut by `over` bytes, but to no fewer than `floor`, saying so.
+fn shorten(line: &str, over: usize, floor: usize) -> String {
+    let room = line.len().saturating_sub(over).max(floor);
+    format!("{}{SHORTENED}", truncate(line, room.saturating_sub(SHORTENED.len())))
 }
 
 fn source(e: &Event) -> Option<String> {
@@ -965,6 +997,45 @@ mod tests {
 
         let roomy = build(&store, &BriefRequest { budget: 100_000, ..req(Some("current")) }).unwrap().unwrap();
         assert!(roomy.text.len() <= MAX_BUDGET);
+    }
+
+    #[test]
+    fn a_long_checkpoint_gives_way_before_a_standing_decision() {
+        let store = Store::open_in_memory().unwrap();
+        seed(&store);
+        for i in 0..decisions::MAX_SHOWN {
+            let text = format!("decision {i} {}", "d".repeat(decisions::MAX_DECISION_BYTES - 12));
+            store.decide(P, Some(&text), None, "claude:6e36f6c2-0000-4000-8000-000000000000", NOW - MIN).unwrap();
+        }
+        let goal = "g".repeat(100);
+        let summary = format!("{}the end.", "handoff ".repeat((MAX_CHECKPOINT_BYTES - 8) / 8));
+        store
+            .checkpoint(Checkpoint {
+                project: P.into(),
+                host: "mcp".into(),
+                summary: summary.clone(),
+                next: vec!["run the War".into()],
+                goal: Some(goal),
+                ..Default::default()
+            })
+            .unwrap();
+        let at =
+            |budget| build(&store, &BriefRequest { budget, now: crate::time::now_ms(), ..req(None) }).unwrap().unwrap();
+
+        let tight = at(DEFAULT_BUDGET);
+        assert!(tight.text.len() <= DEFAULT_BUDGET, "{}", tight.text.len());
+        for i in 0..decisions::MAX_SHOWN {
+            assert!(tight.text.contains(&format!("decision {i} ")), "decision {i} dropped: {}", tight.text);
+        }
+        assert!(tight.text.contains(&format!("…{SHORTENED}")), "{}", tight.text);
+        assert!(!tight.text.contains("the end."), "{}", tight.text);
+        assert!(tight.trimmed.contains(&"checkpoint:shortened".to_string()), "{:?}", tight.trimmed);
+
+        // csm_brief asks for the most room, which holds the whole handoff.
+        let whole = at(MAX_BUDGET);
+        assert!(whole.text.contains(&summary), "{}", whole.text);
+        assert!(!whole.text.contains(SHORTENED), "{}", whole.text);
+        assert!(whole.text.contains("  Next: run the War"), "{}", whole.text);
     }
 
     #[test]

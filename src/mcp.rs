@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::brief::{self, BriefRequest};
 use crate::capture::absolute;
 use crate::claims::{self, peers_json};
-use crate::journal::{Checkpoint, MAX_HANDOFF_BYTES};
+use crate::journal::Checkpoint;
 use crate::messaging::{Message, NewMessage, Peer};
 use crate::store::{Filter, NewMemory, Store, KINDS};
 use crate::time::now_ms;
@@ -171,7 +171,9 @@ impl Server {
         };
         let project = str_arg(args, "project").map(|p| self.resolve(p)).unwrap_or(default_project);
         let include_stale = args.get("include_stale").and_then(Value::as_bool).unwrap_or(false);
-        Ok(peers_json(&self.store, (!all).then_some(project.as_str()), now_ms(), include_stale)?.to_string())
+        let include_ended = args.get("include_ended").and_then(Value::as_bool).unwrap_or(false);
+        let project = (!all).then_some(project.as_str());
+        Ok(peers_json(&self.store, project, now_ms(), include_stale, include_ended)?.to_string())
     }
 
     fn decide(&mut self, args: &Value) -> Result<String> {
@@ -364,7 +366,8 @@ impl Server {
             project: &project,
             current_session: None,
             exclude_active: true,
-            budget: brief::DEFAULT_BUDGET,
+            // Asked for, unlike the session-start briefing: room for a long checkpoint whole.
+            budget: brief::MAX_BUDGET,
             now: now_ms(),
         };
         Ok(match brief::build(&self.store, &request)? {
@@ -374,13 +377,11 @@ impl Server {
     }
 
     fn checkpoint(&mut self, args: &Value) -> Result<String> {
-        let summary = required_str(args, "summary")?.to_string();
-        let long = summary.len() > MAX_HANDOFF_BYTES;
         let result = self.store.checkpoint(Checkpoint {
             project: self.project_for(args),
             host: "mcp".into(),
             session_id: None,
-            summary,
+            summary: required_str(args, "summary")?.to_string(),
             next: list_arg(args, "next"),
             blockers: list_arg(args, "blockers"),
             goal: str_arg(args, "goal").map(str::to_string),
@@ -392,11 +393,6 @@ impl Server {
         }
         if result.goal_id.is_some() {
             text.push_str(" Goal set.");
-        }
-        if long {
-            text.push_str(&format!(
-                " The summary was cut to {MAX_HANDOFF_BYTES} bytes; next steps and blockers have their own fields."
-            ));
         }
         Ok(text)
     }
@@ -552,10 +548,10 @@ fn tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "summary": { "type": "string", "description": "What is done and the current state, in a sentence or two." },
+                    "summary": { "type": "string", "description": "What is done and the current state, up to 1,500 bytes. A longer summary is refused, not cut." },
                     "next": { "type": "array", "items": { "type": "string" }, "description": "Next steps, most important first." },
                     "blockers": { "type": "array", "items": { "type": "string" } },
-                    "goal": { "type": "string", "description": "Set the project's current goal." },
+                    "goal": { "type": "string", "description": "Set the project's current goal, up to 500 bytes." },
                     "goal_done": { "type": "boolean", "description": "Mark the current goal as done." },
                     "project": project
                 },
@@ -574,11 +570,12 @@ fn tools() -> Value {
         },
         {
             "name": "csm_peers",
-            "description": "Discover exact registered recipient IDs, session states and the files each session has claimed (csm_claim) before sending. Defaults to the connected peer's project, or server project before connecting. Active/idle state is last observed, not proof of attention. A quiet session that still holds claims is listed as stale. Use all_projects only for intentional cross-project coordination.",
+            "description": "Discover exact registered recipient IDs, session states and the files each session has claimed (csm_claim) before sending. Defaults to the connected peer's project, or server project before connecting, and to sessions seen in the last 10 minutes. Active/idle state is last observed, not proof of attention; a session in one long tool run can look quiet. A quiet session that still holds claims is listed as stale. Use all_projects only for intentional cross-project coordination.",
             "inputSchema": {"type": "object", "properties": {
                 "project": project,
                 "all_projects": {"type": "boolean", "default": false},
-                "include_stale": {"type": "boolean", "default": false}
+                "include_stale": {"type": "boolean", "default": false, "description": "Also list sessions quiet for over 10 minutes but heard from within the last day. Ended sessions stay out."},
+                "include_ended": {"type": "boolean", "default": false, "description": "Also list ended sessions and ones silent for over a day; rarely useful, and long."}
             }},
             "annotations": {"readOnlyHint": true}
         },
@@ -808,6 +805,12 @@ mod tests {
         let (text, err) = call(&mut s, "csm_checkpoint", json!({ "next": ["x"] }));
         assert!(err);
         assert_eq!(text, "missing required argument: summary");
+
+        let (text, err) = call(&mut s, "csm_checkpoint", json!({ "summary": "x".repeat(1_501) }));
+        assert!(err);
+        assert!(text.contains("nothing was recorded"), "{text}");
+        let (text, _) = call(&mut s, "csm_brief", json!({}));
+        assert!(text.contains("Last checkpoint (just now, via mcp): Released"), "{text}");
     }
 
     #[test]

@@ -186,8 +186,9 @@ fn a_decision_told_to_one_session_reaches_the_others_and_claims_show_up() {
 
     // The claim ends with the session that held it.
     sb.hook("claude", sb.event("SessionEnd", "c1", json!({ "reason": "prompt_input_exit" })));
-    let listing: Value = serde_json::from_str(&sb.text(&["peers", "--include-stale"])).unwrap();
-    assert!(listing["peers"].as_array().unwrap().iter().all(|p| p["claims"] == json!([])), "{listing}");
+    let listing: Value = serde_json::from_str(&sb.text(&["peers", "--include-ended"])).unwrap();
+    let ended = listing["peers"].as_array().unwrap().iter().find(|p| p["state"] == "ended").expect("c1 is listed");
+    assert_eq!(ended["claims"], json!([]), "{listing}");
 }
 
 #[test]

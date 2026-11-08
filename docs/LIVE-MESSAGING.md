@@ -53,7 +53,9 @@ switch to another identity. The token is absent from peer discovery and messages
 1. Connect with the identity supplied by the session hook.
 2. Use `csm_peers` to select a specific recipient, optionally naming your own
    session with `csm_connect`'s label. Presence is last-observed activity, not
-   proof that an agent is listening now.
+   proof that an agent is listening now. It lists sessions seen in the last 10
+   minutes; `include_stale` adds quieter ones heard from within a day, and
+   `include_ended` the ended and long-silent rest.
 3. Send a concise update with `csm_send`, an exact recipient, and a unique
    `request_id`. Retry the same send with the same ID; conflicting reuse fails.
 4. Read incoming envelopes, fetch truncated content with `csm_inbox`, and call

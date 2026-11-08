@@ -36,8 +36,10 @@ pub const KEEP_DAYS: i64 = 90;
 const PRUNE_BATCH: i64 = 1_000;
 
 const MAX_SUMMARY_BYTES: usize = 300;
-/// Checkpoints and goals are written by the agent as handoffs; give them room.
-pub const MAX_HANDOFF_BYTES: usize = 500;
+/// A checkpoint is the agent's handoff to the next session; give it room.
+/// A longer one is refused rather than cut, so nothing is lost mid-sentence.
+pub const MAX_CHECKPOINT_BYTES: usize = 1_500;
+pub const MAX_GOAL_BYTES: usize = 500;
 const MAX_DETAIL_BYTES: usize = 2_000;
 const MAX_FILES: usize = 50;
 const MAX_PATH_BYTES: usize = 300;
@@ -183,10 +185,10 @@ impl Store {
         if e.project.is_empty() || e.host.is_empty() {
             return Err(Error::Invalid("event needs a project and a host".into()));
         }
-        let cap = if matches!(e.kind.as_str(), "checkpoint" | "goal" | "goal_done") {
-            MAX_HANDOFF_BYTES
-        } else {
-            MAX_SUMMARY_BYTES
+        let cap = match e.kind.as_str() {
+            "checkpoint" => MAX_CHECKPOINT_BYTES,
+            "goal" | "goal_done" => MAX_GOAL_BYTES,
+            _ => MAX_SUMMARY_BYTES,
         };
         let summary = truncate(&one_line(&redact(&e.summary).text), cap);
         let detail = e.detail.map(|d| truncate(redact(&d).text.trim(), MAX_DETAIL_BYTES)).filter(|d| !d.is_empty());
@@ -475,6 +477,19 @@ impl Store {
         if c.summary.trim().is_empty() {
             return Err(Error::Invalid("checkpoint summary is empty".into()));
         }
+        let summary = one_line(&c.summary).len();
+        if summary > MAX_CHECKPOINT_BYTES {
+            return Err(Error::Invalid(format!(
+                "checkpoint summary is {summary} bytes, over the {MAX_CHECKPOINT_BYTES}-byte limit; nothing was recorded. \
+                 Shorten it and send it again: next steps and blockers have their own fields"
+            )));
+        }
+        if let Some(goal) = c.goal.as_deref().map(one_line).filter(|g| g.len() > MAX_GOAL_BYTES) {
+            return Err(Error::Invalid(format!(
+                "goal is {} bytes, over the {MAX_GOAL_BYTES}-byte limit; nothing was recorded",
+                goal.len()
+            )));
+        }
         let now = now_ms();
         let event = |kind: &str, summary: String, detail: Option<String>| NewEvent {
             project: c.project.clone(),
@@ -623,14 +638,37 @@ mod tests {
     #[test]
     fn handoffs_get_more_room_than_tool_events() {
         let store = Store::open_in_memory().unwrap();
-        let long = "word ".repeat(200);
+        let long = "word ".repeat(400);
         let mut cp = ev("checkpoint", "s1", &long);
         cp.session_id = None;
         store.record(cp).unwrap();
         store.record(ev("command", "s1", &long)).unwrap();
         let got = store.events(&EventQuery { project: Some(P), limit: 2, ..Default::default() }).unwrap();
         assert!(got[0].summary.len() <= MAX_SUMMARY_BYTES && got[0].summary.len() > 250);
-        assert!(got[1].summary.len() <= MAX_HANDOFF_BYTES && got[1].summary.len() > 450);
+        assert!(got[1].summary.len() <= MAX_CHECKPOINT_BYTES && got[1].summary.len() > 1_450);
+    }
+
+    #[test]
+    fn a_checkpoint_too_long_to_keep_whole_is_refused_not_cut() {
+        let store = Store::open_in_memory().unwrap();
+        let cp = |summary: String, goal: Option<String>| Checkpoint {
+            project: P.into(),
+            host: "mcp".into(),
+            summary,
+            goal,
+            ..Default::default()
+        };
+        let whole = format!("{}.", "w".repeat(MAX_CHECKPOINT_BYTES - 1));
+        let id = store.checkpoint(cp(whole.clone(), None)).unwrap().checkpoint_id;
+        assert_eq!(store.latest_event(P, &["checkpoint"]).unwrap().unwrap().id, id);
+        assert_eq!(store.latest_event(P, &["checkpoint"]).unwrap().unwrap().summary, whole);
+
+        let refused = store.checkpoint(cp(format!("{whole}x"), None)).unwrap_err().to_string();
+        assert!(refused.contains("1501 bytes, over the 1500-byte limit; nothing was recorded"), "{refused}");
+        let refused = store.checkpoint(cp("ok".into(), Some("g".repeat(MAX_GOAL_BYTES + 1)))).unwrap_err();
+        assert!(refused.to_string().contains("goal is 501 bytes"), "{refused}");
+        assert_eq!(store.latest_event(P, &["checkpoint"]).unwrap().unwrap().id, id, "nothing new was recorded");
+        assert!(store.active_goal(P).unwrap().is_none());
     }
 
     #[test]

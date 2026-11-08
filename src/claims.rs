@@ -398,9 +398,15 @@ CREATE INDEX IF NOT EXISTS csm_file_claims_peer ON csm_file_claims (peer);
 /// The `csm peers` / `csm_peers` listing: each session with the files it
 /// has claimed. A session holding claims is listed even after it has gone
 /// quiet, so a claim never hides behind the stale filter.
-pub fn peers_json(store: &Store, project: Option<&str>, now: i64, include_stale: bool) -> Result<Value> {
+pub fn peers_json(
+    store: &Store,
+    project: Option<&str>,
+    now: i64,
+    include_stale: bool,
+    include_ended: bool,
+) -> Result<Value> {
     let claims = store.active_claims(now)?;
-    let mut peers = store.peers(project, now, include_stale)?;
+    let mut peers = store.peers(project, now, include_stale, include_ended)?;
     for claim in &claims {
         if peers.iter().any(|p| p.id == claim.peer) {
             continue;
@@ -689,7 +695,7 @@ mod tests {
         peer(&store, "claude:quiet", NOW - 20 * MIN);
         store.claim_files(&codex, &files(&["scripts/ground_field.gd"]), 60, Some("rework"), NOW - 20 * MIN).unwrap();
 
-        let listing = peers_json(&store, Some(P), NOW, false).unwrap();
+        let listing = peers_json(&store, Some(P), NOW, false, false).unwrap();
         let peers = listing["peers"].as_array().unwrap();
         let ids: Vec<&str> = peers.iter().map(|p| p["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["claude:b", "codex:a"], "a stale holder stays listed; a stale peer without claims does not");
@@ -699,7 +705,7 @@ mod tests {
         assert_eq!(holder["claims"][0]["minutes_left"], 40);
         assert_eq!(holder["claims"][0]["note"], "rework");
         assert_eq!(peers[0]["claims"], json!([]));
-        assert_eq!(peers_json(&store, Some(P), NOW, true).unwrap()["peers"].as_array().unwrap().len(), 3);
+        assert_eq!(peers_json(&store, Some(P), NOW, true, false).unwrap()["peers"].as_array().unwrap().len(), 3);
     }
 
     #[test]
@@ -711,9 +717,18 @@ mod tests {
             peer(&store, &id, NOW - MIN);
             store.set_peer_state(&id, "ended", NOW - MIN).unwrap();
         }
-        let listing = peers_json(&store, Some(P), NOW, false).unwrap();
+        let listing = peers_json(&store, Some(P), NOW, false, false).unwrap();
         let ids: Vec<&str> = listing["peers"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["codex:live"]);
+
+        // Nor when asking for quiet sessions, which are still worth reaching.
+        peer(&store, "codex:quiet", NOW - 3 * 60 * MIN);
+        peer(&store, "codex:gone", NOW - 2 * 24 * 60 * MIN);
+        let listing = peers_json(&store, Some(P), NOW, true, false).unwrap();
+        let ids: Vec<&str> = listing["peers"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["codex:live", "codex:quiet"]);
+        let listing = peers_json(&store, Some(P), NOW, false, true).unwrap();
+        assert_eq!(listing["peers"].as_array().unwrap().len(), 100, "ended sessions are there when asked for");
     }
 
     #[test]
