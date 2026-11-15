@@ -49,11 +49,18 @@ The setup status confirms configuration, not successful live delivery.
 The session hook gives the agent its exact host, session ID, and private binding
 token. `csm_connect` binds that MCP process to that identity; it cannot then
 switch to another identity. The token is absent from peer discovery and messages.
+`csm_connect` also takes the agent's model ID. What a connected session saves,
+checkpoints, decides and claims is recorded with the model it was running as at
+the time, and `csm_peers` lists each session's current model. The session's
+hooks correct it whenever the host shows which model is answering, so a model
+switched mid-session is picked up without connecting again.
 
 1. Connect with the identity supplied by the session hook.
 2. Use `csm_peers` to select a specific recipient, optionally naming your own
    session with `csm_connect`'s label. Presence is last-observed activity, not
-   proof that an agent is listening now.
+   proof that an agent is listening now. It lists sessions seen in the last 10
+   minutes; `include_stale` adds quieter ones heard from within a day, and
+   `include_ended` the ended and long-silent rest.
 3. Send a concise update with `csm_send`, an exact recipient, and a unique
    `request_id`. Retry the same send with the same ID; conflicting reuse fails.
 4. Read incoming envelopes, fetch truncated content with `csm_inbox`, and call
@@ -63,9 +70,43 @@ switch to another identity. The token is absent from peer discovery and messages
 
 Messages from a different project require an explicit `allow_cross_project`
 send. This is useful where the same logical project uses separate folder keys.
-There is no broadcast, automatic task assignment, or automatic reply loop.
+Messages have no broadcast, automatic task assignment, or automatic reply loop;
+the decision board below is the one thing every session hears.
 Peer messages remain agent-authored data and cannot supply human approval or
 override a session's instructions. Acknowledgment is receipt, not agreement.
+
+## Standing decisions and file claims
+
+Some things every session in a project should know, not just the one the user
+said them to. `csm_decide` (or `csm decide "..."`) puts a standing decision the
+user made, such as "saves don't matter: those real-game runs are deliberate",
+on the project's board. Every session sees the board in its briefing at session
+start, and a session that is already running is told on its next prompt or
+tool call after the board changes, once per change. A subagent starts without
+its parent's briefing, so its first tool call shows it the whole board, and it
+is told each change after that. `csm_decide` with
+`withdraw` takes one back or replaces it; `csm_decisions` lists the board. The
+board works without messaging. Agents should record only what the user said or
+confirmed; entries are context for the work, not permission.
+
+After `csm_connect`, `csm_claim` marks files (absolute paths) a session is
+about to change, for 1 to 240 minutes (default 30). Claims appear on their holder in `csm_peers`,
+in other sessions' briefings, and as a warning just before another session
+edits a claimed file. A file another session holds is not claimed; its holder
+is reported instead. Claims are advisory: nothing is locked. They end with
+`csm_release`, at expiry, or when the holding session ends. A quiet session
+that still holds claims stays listed in `csm_peers` as stale.
+
+Subagents use their session's connection, so what they claim is the session's
+claim. The hooks note which subagent claimed each file: its sibling subagents
+are warned before editing it, and the session itself is not. A subagent's
+claim pauses when it stops (Claude Code's `SubagentStop`) and holds again
+when it is resumed (`SubagentStart`) or does anything more; a paused claim
+gives way to the next claim on its file. A claim made through MCP on a file
+the session or a sibling already holds keeps that holder and its note and is
+only ever lengthened; a subagent that reached a sibling's file this way is
+told it did not become its own. The session can always take a file back by
+claiming it.
 
 ## Storage and limits
 

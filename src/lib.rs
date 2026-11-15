@@ -5,12 +5,18 @@
 
 pub mod brief;
 pub mod capture;
+pub mod claims;
+pub mod decisions;
 pub mod hook;
 pub mod journal;
+pub mod leases;
+pub mod links;
 pub mod mcp;
 pub mod messaging;
+pub mod model;
 pub mod paths;
 pub mod project;
+pub mod recall;
 pub mod redact;
 pub mod setup;
 pub mod store;

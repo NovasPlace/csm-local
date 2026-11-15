@@ -3,7 +3,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use csm_local::brief::{self, BriefRequest};
-use csm_local::journal::{Checkpoint, EventQuery, EVENT_KINDS, MAX_HANDOFF_BYTES};
+use csm_local::capture::absolute;
+use csm_local::claims::{self, peers_json};
+use csm_local::journal::{Checkpoint, EventQuery, EVENT_KINDS};
 use csm_local::mcp::{inbox_json, message_json, wait_for_messages, Server};
 use csm_local::messaging::NewMessage;
 use csm_local::store::{Filter, NewMemory, Store};
@@ -25,7 +27,7 @@ enum Command {
     /// Save a memory for the current project
     Save {
         content: String,
-        /// note, lesson, decision or fact
+        /// note, lesson, decision, fact, or card (the one project card every briefing opens with)
         #[arg(long, default_value = "note")]
         kind: String,
         /// Comma-separated tags
@@ -103,10 +105,10 @@ enum Command {
     /// Record where the work stands, for the next session
     Checkpoint {
         summary: String,
-        /// A next step (repeatable)
+        /// A next step (repeatable, up to 5, each up to 180 bytes)
         #[arg(long)]
         next: Vec<String>,
-        /// A blocker (repeatable)
+        /// A blocker (repeatable, up to 5, each up to 180 bytes)
         #[arg(long)]
         blocker: Vec<String>,
         /// Set the project's goal
@@ -117,6 +119,24 @@ enum Command {
         goal_done: bool,
         #[arg(long)]
         project: Option<PathBuf>,
+    },
+    /// Put a standing decision you made on the project's board, which every session there sees
+    Decide {
+        /// The decision, in a sentence
+        decision: Option<String>,
+        /// Withdraw this standing decision; with DECISION, replace it
+        #[arg(long)]
+        withdraw: Option<i64>,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// List the project's standing decisions, newest first
+    Decisions {
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Print every entry, withdrawals included, as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Show database location and counts
     Status {
@@ -130,7 +150,7 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Permanently delete project memories, journal events, messaging peers and their messages
+    /// Permanently delete project memories, journal events, messaging peers, their messages and the decision board
     Forget {
         #[arg(long)]
         project: PathBuf,
@@ -144,8 +164,12 @@ enum Command {
         project: Option<PathBuf>,
         #[arg(long)]
         all_projects: bool,
+        /// Also list sessions quiet for over 10 minutes but heard from within the last day
         #[arg(long)]
         include_stale: bool,
+        /// Also list ended sessions and ones silent for over a day
+        #[arg(long)]
+        include_ended: bool,
     },
     /// Send addressed peer coordination with durable delivery, not human permission (JSON)
     Send {
@@ -198,11 +222,42 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Claim files for a peer for a limited time; advisory, nothing is locked (JSON)
+    Claim {
+        /// Exact hook-registered host:session ID that holds the claims
+        #[arg(long)]
+        peer: String,
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<String>,
+        #[arg(long, default_value_t = claims::DEFAULT_MINUTES)]
+        minutes: i64,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Release a peer's file claims: the files given, or all of them (JSON)
+    Release {
+        #[arg(long)]
+        peer: String,
+        files: Vec<String>,
+    },
     /// Manage opt-in idle inbox wake-ups (no model credentials or terminal injection)
     Wake {
         #[command(subcommand)]
         action: WakeCommand,
     },
+    /// Count sessions started in FOLDER as part of another project; with no arguments, list links
+    Link {
+        /// The folder sessions start in, e.g. where Claude Code is launched
+        folder: Option<PathBuf>,
+        /// The project those sessions belong to
+        #[arg(long)]
+        into: Option<PathBuf>,
+        /// Move the folder's history and create the link; without this, only show what would move
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Stop counting FOLDER as another project (history already moved stays there)
+    Unlink { folder: PathBuf },
     /// Run the MCP server on stdin/stdout
     Mcp {
         #[arg(long)]
@@ -343,12 +398,13 @@ fn stored_project_key(store: &Store, path: &std::path::Path) -> Result<String> {
     }
 }
 
-fn resolve_project(path: Option<PathBuf>) -> Result<String> {
+/// The project for a folder (default: the current one), following `csm link`.
+fn resolve_project(store: &Store, path: Option<PathBuf>) -> Result<String> {
     let dir = match path {
         Some(p) => p,
         None => std::env::current_dir()?,
     };
-    Ok(project::resolve(&dir))
+    store.canonical_project(&project::resolve(&dir))
 }
 
 fn print_json<T: serde::Serialize>(value: &T) {
@@ -366,6 +422,15 @@ fn require_peer(store: &Store, peer: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Command-line file arguments as absolute paths, relative ones against the current folder.
+fn absolute_paths(files: &[String]) -> Result<Vec<String>> {
+    let cwd = std::env::current_dir()?.display().to_string();
+    if files.iter().any(|f| f.trim().is_empty()) {
+        return Err(Error::Invalid("file paths must not be empty".into()));
+    }
+    Ok(files.iter().map(|f| absolute(&cwd, f)).collect())
 }
 
 fn require_message_limit(limit: usize) -> Result<()> {
@@ -426,10 +491,13 @@ fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Save { content, kind, tags, importance, project } => {
-            let project = resolve_project(project)?;
-            let saved = store.save(NewMemory { project, kind, content, tags, importance, source: None })?;
+            let project = resolve_project(&store, project)?;
+            let saved =
+                store.save(NewMemory { project, kind, content, tags, importance, source: None, model: None })?;
             if saved.duplicate {
                 println!("Already saved as #{}.", saved.memory.id);
+            } else if saved.replaced {
+                println!("Saved #{}, in place of the last card.", saved.memory.id);
             } else {
                 println!("Saved #{}.", saved.memory.id);
             }
@@ -438,7 +506,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Search { query, limit, kind, all, project, json } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             let filter = Filter { project: (!all).then_some(project.as_str()), kind: kind.as_deref(), limit };
             let hits = store.search(&query, filter)?;
             if json {
@@ -450,7 +518,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::List { limit, kind, all, project, json } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             let filter = Filter { project: (!all).then_some(project.as_str()), kind: kind.as_deref(), limit };
             let memories = store.list(filter)?;
             if json {
@@ -468,9 +536,15 @@ fn run(cli: Cli) -> Result<()> {
             println!("Deleted #{id}.");
         }
         Command::Brief { project, budget, explain } => {
-            let project = resolve_project(project)?;
-            let request =
-                BriefRequest { project: &project, current_session: None, exclude_active: true, budget, now: now_ms() };
+            let project = resolve_project(&store, project)?;
+            let request = BriefRequest {
+                project: &project,
+                current_session: None,
+                exclude_active: true,
+                resumed: false,
+                budget,
+                now: now_ms(),
+            };
             match brief::build(&store, &request)? {
                 Some(b) => {
                     println!("{}", b.text);
@@ -485,7 +559,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Journal { limit, kind, session, all, project, json } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             if let Some(k) = kind.as_deref().filter(|k| !EVENT_KINDS.contains(k)) {
                 return Err(Error::Invalid(format!("unknown kind {k}; one of: {}", EVENT_KINDS.join(", "))));
             }
@@ -523,11 +597,8 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Checkpoint { summary, next, blocker, goal, goal_done, project } => {
-            if summary.len() > MAX_HANDOFF_BYTES || goal.as_ref().is_some_and(|g| g.len() > MAX_HANDOFF_BYTES) {
-                eprintln!("Note: the summary and goal are kept to {MAX_HANDOFF_BYTES} bytes each.");
-            }
             let result = store.checkpoint(Checkpoint {
-                project: resolve_project(project)?,
+                project: resolve_project(&store, project)?,
                 host: "cli".into(),
                 session_id: None,
                 summary,
@@ -535,14 +606,32 @@ fn run(cli: Cli) -> Result<()> {
                 blockers: blocker,
                 goal,
                 goal_done,
+                model: None,
             })?;
             println!("Checkpoint #{} recorded.", result.checkpoint_id);
             if let Some(closed) = result.closed_goal {
                 println!("Closed goal: {closed}");
             }
         }
+        Command::Decide { decision, withdraw, project } => {
+            let project = resolve_project(&store, project)?;
+            let decided = store.decide(&project, decision.as_deref(), withdraw, "cli", now_ms())?;
+            println!("{}", decided.summary());
+        }
+        Command::Decisions { project, json } => {
+            let project = resolve_project(&store, project)?;
+            if json {
+                print_json(&store.decision_history(Some(&project))?);
+            } else {
+                let board = store.decisions(&project)?;
+                if board.is_empty() {
+                    println!("No standing decisions on this project's board.");
+                }
+                board.iter().for_each(|d| println!("{}", d.line(now_ms())));
+            }
+        }
         Command::Status { project } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             let stats = store.stats(Some(&project))?;
             println!("csm {}", env!("CARGO_PKG_VERSION"));
             println!("database: {}", db.display());
@@ -550,29 +639,89 @@ fn run(cli: Cli) -> Result<()> {
             println!("memories in this project: {}", stats.project_memories.unwrap_or(0));
             println!("memories total: {} across {} project(s)", stats.memories, stats.projects);
             println!("journal events in this project: {}", stats.events);
+            println!("standing decisions in this project: {}", store.decisions(&project)?.len());
             if let Some((host, bytes, _)) = store.last_injection()? {
                 println!("last briefing injected: {bytes} bytes via {host}");
             }
             if let Some(line) = hook::last_failure() {
                 println!("last hook error: {line}");
             }
+            for (other, edits) in store.related_projects(&project)?.into_iter().take(3) {
+                println!("sessions started in {other} edited files here ({edits} edits); `csm link` can make them one project");
+            }
+        }
+        Command::Link { folder, into, yes } => match (folder, into) {
+            (None, None) => {
+                let links = store.links()?;
+                if links.is_empty() {
+                    println!("No linked folders.");
+                }
+                for (folder, project) in links {
+                    println!("{folder} -> {project}");
+                }
+                let here = resolve_project(&store, None)?;
+                for (other, edits) in store.related_projects(&here)?.into_iter().take(5) {
+                    println!("Sessions started in {other} made {edits} edits in {here}. To share one memory:");
+                    println!("  csm link \"{other}\" --into \"{here}\"");
+                }
+            }
+            (Some(folder), Some(into)) => {
+                // The folder's own key, not where it may already be linked.
+                let folder = project::resolve(&folder);
+                let into = resolve_project(&store, Some(into))?;
+                if yes {
+                    let moved = store.link_project(&folder, &into)?;
+                    println!(
+                        "Linked {folder} into {into}: moved {} memories and {} journal events. Sessions started there now count as {into}.",
+                        moved.memories, moved.events
+                    );
+                } else {
+                    let would = store.link_preview(&folder)?;
+                    println!(
+                        "Would link {folder} into {into}, moving {} memories and {} journal events. Re-run with --yes to do it.",
+                        would.memories, would.events
+                    );
+                }
+            }
+            _ => return Err(Error::Invalid("give both FOLDER and --into PROJECT, or neither to list links".into())),
+        },
+        Command::Unlink { folder } => {
+            let folder = project::resolve(&folder);
+            if store.unlink_project(&folder)? {
+                println!("Unlinked {folder}. History already moved stays in the project it was linked into.");
+            } else {
+                println!("{folder} is not linked.");
+            }
         }
         Command::Export { project, all } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             let scope = (!all).then_some(project.as_str());
             let events = store.events(&EventQuery { project: scope, limit: usize::MAX >> 1, ..Default::default() })?;
-            print_json(&serde_json::json!({ "memories": store.export(scope)?, "events": events }));
+            print_json(&serde_json::json!({
+                "memories": store.export(scope)?,
+                "events": events,
+                "decisions": store.decision_history(scope)?,
+            }));
         }
         Command::Forget { project, yes } => {
             let project = stored_project_key(&store, &project)?;
             let memories = store.count_project(&project)?;
             let events = store.stats(Some(&project))?.events;
             let (messages, peers) = store.mailbox_project_counts(&project)?;
+            let links =
+                store.links()?.into_iter().filter(|(folder, into)| *folder == project || *into == project).count();
+            let decisions = store.decision_history(Some(&project))?.len();
             if yes {
                 // Always scrub, even with nothing left to delete: a run that
                 // was blocked by another process finishes here.
                 let forgotten = store.forget_project(&project)?;
-                if forgotten.memories == 0 && forgotten.events == 0 && forgotten.messages == 0 && forgotten.peers == 0 {
+                if forgotten.memories == 0
+                    && forgotten.events == 0
+                    && forgotten.messages == 0
+                    && forgotten.peers == 0
+                    && forgotten.links == 0
+                    && forgotten.decisions == 0
+                {
                     println!("Nothing is stored for {project}.");
                 } else {
                     println!(
@@ -585,6 +734,12 @@ fn run(cli: Cli) -> Result<()> {
                             forgotten.messages, forgotten.peers
                         );
                     }
+                    if forgotten.links > 0 {
+                        println!("Removed {} folder link(s) into or out of {project}.", forgotten.links);
+                    }
+                    if forgotten.decisions > 0 {
+                        println!("Also deleted {} decision board entries.", forgotten.decisions);
+                    }
                 }
                 if !forgotten.scrubbed {
                     println!(
@@ -593,7 +748,7 @@ fn run(cli: Cli) -> Result<()> {
                          to finish scrubbing."
                     );
                 }
-            } else if memories == 0 && events == 0 && messages == 0 && peers == 0 {
+            } else if memories == 0 && events == 0 && messages == 0 && peers == 0 && links == 0 && decisions == 0 {
                 println!("Nothing is stored for {project}.");
             } else {
                 println!(
@@ -602,13 +757,18 @@ fn run(cli: Cli) -> Result<()> {
                 if messages > 0 || peers > 0 {
                     println!("Would also delete {messages} messages and {peers} messaging peers.");
                 }
+                if links > 0 {
+                    println!("Would also remove {links} folder link(s) into or out of {project}.");
+                }
+                if decisions > 0 {
+                    println!("Would also delete {decisions} decision board entries.");
+                }
             }
         }
-        Command::Peers { project, all_projects, include_stale } => {
-            let project = resolve_project(project)?;
-            print_json(
-                &serde_json::json!({"peers": store.peers((!all_projects).then_some(project.as_str()), now_ms(), include_stale)?}),
-            );
+        Command::Peers { project, all_projects, include_stale, include_ended } => {
+            let project = resolve_project(&store, project)?;
+            let project = (!all_projects).then_some(project.as_str());
+            print_json(&peers_json(&store, project, now_ms(), include_stale, include_ended)?);
         }
         Command::Send { from, to, request_id, content, reply_to, allow_cross_project, ttl_seconds } => {
             require_peer(&store, &from)?;
@@ -651,6 +811,19 @@ fn run(cli: Cli) -> Result<()> {
             let messages = wait_for_messages(&store, &peer, timeout_seconds, limit)?;
             print_json(&inbox_json(&peer, &messages));
         }
+        Command::Claim { peer, files, minutes, note } => {
+            require_peer(&store, &peer)?;
+            let holder = store.peer(&peer)?.expect("checked above");
+            let paths = absolute_paths(&files)?;
+            let now = now_ms();
+            print_json(&store.claim_files(&holder, &paths, minutes, note.as_deref(), now)?.json(&peer, now));
+        }
+        Command::Release { peer, files } => {
+            require_peer(&store, &peer)?;
+            let paths = absolute_paths(&files)?;
+            let released = store.release_claims(&peer, (!paths.is_empty()).then_some(paths.as_slice()))?;
+            print_json(&serde_json::json!({"peer": peer, "released": released}));
+        }
         Command::Wake { action } => match action {
             WakeCommand::Enable => {
                 store.set_wake_enabled(true)?;
@@ -674,7 +847,7 @@ fn run(cli: Cli) -> Result<()> {
             WakeCommand::CodexCall => unreachable!("handled before opening the store"),
         },
         Command::Mcp { project } => {
-            let project = resolve_project(project)?;
+            let project = resolve_project(&store, project)?;
             Server::new(store, project).run_stdio()?;
         }
         Command::Hook { .. } | Command::Setup { .. } => unreachable!("handled before opening the store"),

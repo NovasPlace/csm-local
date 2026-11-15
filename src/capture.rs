@@ -180,6 +180,36 @@ pub fn tool_event(host: Host, payload: &Value, roots: &[String], failed: bool) -
     Some(event)
 }
 
+/// A shell command that runs csm's command line to save something.
+static SAVE_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)csm\w*(?:\.exe)?["']?\s+(?:--db\s+\S+\s+)?(save|checkpoint|decide)\b"#).unwrap()
+});
+
+/// What a tool call saved for later sessions, if it saved anything: a
+/// memory, a checkpoint or a standing decision, through csm's tools or its
+/// command line.
+pub fn saved(payload: &Value) -> Option<&'static str> {
+    let tool = payload.get("tool_name")?.as_str()?;
+    let named = |name: &str| tool == name || tool.strip_suffix(name).is_some_and(|server| server.ends_with("__"));
+    if let Some(name) = ["csm_save", "csm_checkpoint", "csm_decide"].into_iter().find(|name| named(name)) {
+        return Some(name);
+    }
+    if !matches!(tool, "Bash" | "PowerShell" | "shell" | "exec_command" | "local_shell") {
+        return None;
+    }
+    let input = payload.get("tool_input")?;
+    let command = match input.get("command").or_else(|| input.get("cmd"))? {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+        _ => return None,
+    };
+    match SAVE_COMMAND.captures(&command)?.get(1)?.as_str().to_ascii_lowercase().as_str() {
+        "save" => Some("csm save"),
+        "checkpoint" => Some("csm checkpoint"),
+        _ => Some("csm decide"),
+    }
+}
+
 /// csm's own MCP tools, under any server alias that contains "csm".
 pub fn is_own_tool(tool: &str) -> bool {
     tool.starts_with("mcp__csm__") || (tool.starts_with("mcp__") && tool.contains("_csm__"))
@@ -312,12 +342,87 @@ fn patch_files(patch: &str) -> Vec<(PatchOp, String)> {
     out
 }
 
+/// The files an edit tool is about to change or just changed, as absolute
+/// forward-slash paths. Empty for every other tool.
+pub fn target_files(payload: &Value) -> Vec<String> {
+    let Some(tool) = payload.get("tool_name").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let input = payload.get("tool_input").unwrap_or(&Value::Null);
+    let cwd = payload.get("cwd").and_then(Value::as_str).unwrap_or("");
+    let named = |key: &str| input.get(key).and_then(Value::as_str).map(|p| vec![p.to_string()]).unwrap_or_default();
+    let paths = match tool {
+        "Edit" | "MultiEdit" | "Write" => named("file_path"),
+        "NotebookEdit" => named("notebook_path"),
+        "apply_patch" => {
+            let patch = match input {
+                Value::String(s) => Some(s.as_str()),
+                _ => ["command", "patch", "input"].iter().find_map(|k| input.get(*k)?.as_str()),
+            };
+            patch.map(|p| patch_files(p).into_iter().map(|(_, f)| f).collect()).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for path in paths.iter().filter(|p| !p.trim().is_empty()) {
+        let abs = absolute(cwd, path);
+        if !out.contains(&abs) {
+            out.push(abs);
+        }
+    }
+    out
+}
+
+/// `path` as an absolute forward-slash path, joining a relative one to `base`.
+pub fn absolute(base: &str, path: &str) -> String {
+    let path = normalize(path.trim());
+    let joined = if is_absolute(&path) || base.is_empty() {
+        path
+    } else {
+        format!("{}/{}", normalize(base).trim_end_matches('/'), path)
+    };
+    collapse_dots(&joined)
+}
+
+/// Resolves `.` and `..` segments without touching the filesystem, keeping
+/// the root (`C:`, `//server/share`, `/`) and any leading `..` of a relative path.
+fn collapse_dots(path: &str) -> String {
+    let (root, rest) = if let Some(unc) = path.strip_prefix("//") {
+        let mut parts = unc.splitn(3, '/');
+        let server = parts.next().unwrap_or("");
+        let share = parts.next().unwrap_or("");
+        (format!("//{server}/{share}"), parts.next().unwrap_or(""))
+    } else if path.as_bytes().get(1) == Some(&b':') && path.is_char_boundary(2) {
+        (path[..2].to_string(), &path[2..])
+    } else if let Some(rest) = path.strip_prefix('/') {
+        ("/".to_string(), rest)
+    } else {
+        (String::new(), path)
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in rest.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." if segments.last().is_some_and(|s| *s != "..") => {
+                segments.pop();
+            }
+            ".." if root.is_empty() => segments.push(".."),
+            ".." => {}
+            name => segments.push(name),
+        }
+    }
+    let body = segments.join("/");
+    match root.as_str() {
+        "" => body,
+        "/" => format!("/{body}"),
+        root => format!("{root}/{body}"),
+    }
+}
+
 /// A path relative to the first of `roots` that contains it, with forward
 /// slashes, or the normalized absolute path when it lies outside them all.
 pub fn rel_path(roots: &[String], cwd: &str, path: &str) -> String {
-    let path = normalize(path.trim());
-    let abs = if is_absolute(&path) { path } else { format!("{}/{}", normalize(cwd).trim_end_matches('/'), path) };
-    let abs = abs.replace("/./", "/");
+    let abs = absolute(cwd, path);
     for root in roots {
         let root = format!("{}/", normalize(root).trim_end_matches('/'));
         let matches = if cfg!(windows) {
@@ -589,6 +694,53 @@ mod tests {
         assert!(event(Host::Claude, &claude("Edit", json!({})), false).is_none());
         assert!(event(Host::Claude, &claude("Bash", json!({ "command": "   " })), false).is_none());
         assert!(event(Host::Claude, &json!({}), false).is_none());
+    }
+
+    #[test]
+    fn saved_names_what_a_tool_call_kept_for_later_sessions() {
+        let tool = |name: &str| json!({ "tool_name": name, "tool_input": { "content": "x" } });
+        assert_eq!(saved(&tool("mcp__csm__csm_save")), Some("csm_save"));
+        assert_eq!(saved(&tool("mcp__my_csm__csm_checkpoint")), Some("csm_checkpoint"));
+        assert_eq!(saved(&tool("csm_decide")), Some("csm_decide"));
+        for other in ["mcp__csm__csm_search", "mcp__csm__csm_brief", "mcp__other__not_csm_save", "Edit"] {
+            assert!(saved(&tool(other)).is_none(), "{other}");
+        }
+
+        let shell = |tool: &str, command: &str| json!({ "tool_name": tool, "tool_input": { "command": command } });
+        assert_eq!(saved(&shell("Bash", "csm save 'LTO is needed' --kind lesson")), Some("csm save"));
+        let skill = "& $csmExe checkpoint 'Hooks wired' --project $csmProject";
+        assert_eq!(saved(&shell("PowerShell", skill)), Some("csm checkpoint"));
+        let full = "\"C:/Users/me/.csm/bin/csm.exe\" --db C:/tmp/x.db decide 'saves do not matter'";
+        assert_eq!(saved(&shell("Bash", full)), Some("csm decide"));
+        for other in ["csm search lto", "csm status", "cargo test save", "echo csm_save"] {
+            assert!(saved(&shell("Bash", other)).is_none(), "{other}");
+        }
+        let patch = "*** Update File: docs/USAGE.md\n+run csm save to keep it";
+        assert!(saved(&shell("apply_patch", patch)).is_none(), "a patch is not a shell");
+        assert!(saved(&json!({})).is_none());
+    }
+
+    #[test]
+    fn target_files_name_what_an_edit_tool_will_change() {
+        let claude = json!({ "tool_name": "Edit", "cwd": "C:/work/app", "tool_input": { "file_path": r"C:\work\app\src\a.rs" } });
+        assert_eq!(target_files(&claude), ["C:/work/app/src/a.rs"]);
+        let codex = json!({ "tool_name": "apply_patch", "cwd": "C:/work/app/sub",
+                            "tool_input": { "command": "*** Update File: x.rs
+*** Add File: ./y.rs
+*** Update File: x.rs" } });
+        assert_eq!(target_files(&codex), ["C:/work/app/sub/x.rs", "C:/work/app/sub/y.rs"]);
+        assert!(target_files(&json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } })).is_empty());
+        assert!(target_files(&json!({ "tool_name": "Write", "tool_input": {} })).is_empty());
+    }
+
+    #[test]
+    fn absolute_collapses_dot_segments_without_the_filesystem() {
+        assert_eq!(absolute("C:/work/launch", "../app/src/x.rs"), "C:/work/app/src/x.rs");
+        assert_eq!(absolute("C:/work", "./a/./b/../c.rs"), "C:/work/a/c.rs");
+        assert_eq!(absolute("", "//srv/share/repo/../lib/x.rs"), "//srv/share/lib/x.rs");
+        assert_eq!(absolute("", "/home/me/../you/x"), "/home/you/x");
+        assert_eq!(absolute("C:/", "../../x"), "C:/x", "never climbs above the root");
+        assert_eq!(absolute("", "../x"), "../x", "a relative path keeps its leading ..");
     }
 
     #[test]

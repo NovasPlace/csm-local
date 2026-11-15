@@ -6,7 +6,17 @@ use serde_json::{json, Value};
 const NOW: i64 = 1_800_000_000_000;
 
 fn env() -> HookEnv {
-    HookEnv { project_dir: None, capture_text: true, budget: 8000, now: NOW, messaging: true, codex_app_pipe: None }
+    HookEnv {
+        project_dir: None,
+        capture_text: true,
+        budget: 8000,
+        now: NOW,
+        messaging: true,
+        codex_app_pipe: None,
+        claim_check: true,
+        recall: true,
+        save_nudge: true,
+    }
 }
 
 fn event(name: &str, session: &str) -> Value {
@@ -84,6 +94,31 @@ fn stop_continues_only_for_new_mail_and_never_loops() {
     stopping["stop_hook_active"] = json!(true);
     assert!(handle(&store, Host::Codex, &stopping, &env()).unwrap().is_none());
     assert_eq!(store.pending_messages("codex:receiver", 10, NOW, true).unwrap().len(), 1);
+}
+
+#[test]
+fn a_stop_sent_back_for_mail_and_an_unbacked_claim_carries_both() {
+    let store = Store::open_in_memory().unwrap();
+    enroll(&store);
+    let mut ask = event("UserPromptSubmit", "receiver");
+    ask["prompt"] = json!("fix the collision case");
+    handle(&store, Host::Codex, &ask, &env()).unwrap();
+    let mut patch = event("PostToolUse", "receiver");
+    patch["tool_name"] = json!("apply_patch");
+    patch["tool_input"] =
+        json!({"command": "*** Begin Patch\n*** Update File: src/collide.rs\n@@\n-a\n+b\n*** End Patch"});
+    patch["tool_response"] = json!({});
+    handle(&store, Host::Codex, &patch, &env()).unwrap();
+    send(&store, "mail", "Please inspect the failing collision case.");
+    let mut stop = event("Stop", "receiver");
+    stop["last_assistant_message"] = json!("Fixed: collisions now resolve against the wall.");
+    let out = handle(&store, Host::Codex, &stop, &env()).unwrap().unwrap();
+    let value: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["decision"], "block");
+    let reason = value["reason"].as_str().unwrap();
+    assert!(reason.starts_with("CSM claim check: your reply says \"Fixed: collisions now resolve against the wall\""));
+    assert!(reason.contains("last change to collide.rs"), "{reason}");
+    assert!(reason.contains("\n\nCSM local messaging.") && reason.contains("failing collision"), "{reason}");
 }
 
 #[test]

@@ -6,7 +6,7 @@ use std::sync::{
 };
 use std::thread;
 
-use csm_local::messaging::{NewMessage, PEER_STALE_MS};
+use csm_local::messaging::{NewMessage, PEER_GONE_MS, PEER_STALE_MS};
 use csm_local::store::{NewMemory, Store};
 
 const NOW: i64 = 1_800_000_000_000;
@@ -58,6 +58,7 @@ fn memory() -> NewMemory {
         tags: vec![],
         importance: 3,
         source: None,
+        model: None,
     }
 }
 
@@ -238,12 +239,17 @@ fn peer_heartbeats_preserve_intro_label_project_and_monotonic_state() {
     assert!(store.register_peer("other", "codex", "one", None, "active", NOW).is_err());
     assert!(store.set_peer_state("missing", "active", NOW).is_err());
     assert!(store.claim_peer_intro("missing", NOW).is_err());
-    assert_eq!(store.peers(Some(PROJECT), NOW, false).unwrap().len(), 2);
-    assert!(store.peers(Some(PROJECT), NOW + PEER_STALE_MS + 1, false).unwrap().is_empty());
-    let old = store.peers(Some(PROJECT), NOW + PEER_STALE_MS + 1, true).unwrap();
+    assert_eq!(store.peers(Some(PROJECT), NOW, false, false).unwrap().len(), 2);
+    assert!(store.peers(Some(PROJECT), NOW + PEER_STALE_MS + 1, false, false).unwrap().is_empty());
+    let quiet = store.peers(Some(PROJECT), NOW + PEER_STALE_MS + 1, true, false).unwrap();
+    assert_eq!(quiet.len(), 2, "the ended session stays out");
+    assert!(quiet.iter().all(|p| p.state == "stale"));
+    let old = store.peers(Some(PROJECT), NOW + PEER_STALE_MS + 1, false, true).unwrap();
     assert_eq!(old.len(), 3);
     assert_eq!(old.iter().filter(|p| p.state == "stale").count(), 2);
-    assert!(store.peers(Some("other"), NOW, true).unwrap().is_empty());
+    assert!(store.peers(Some(PROJECT), NOW + PEER_GONE_MS + 3, true, false).unwrap().is_empty());
+    assert_eq!(store.peers(Some(PROJECT), NOW + PEER_GONE_MS + 3, false, true).unwrap().len(), 3);
+    assert!(store.peers(Some("other"), NOW, true, true).unwrap().is_empty());
 }
 
 #[test]
@@ -253,7 +259,7 @@ fn peers_are_bounded_and_message_validation_counts_utf8_bytes() {
     for i in 0..110 {
         store.register_peer(PROJECT, "codex", &format!("peer-{i}"), None, "active", NOW + i).unwrap();
     }
-    let peers = store.peers(None, NOW + 200, true).unwrap();
+    let peers = store.peers(None, NOW + 200, true, false).unwrap();
     assert_eq!(peers.len(), 100);
     assert_eq!(peers[0].id, "codex:peer-109");
     for content in [" ".into(), "abc\0def".into(), "é".repeat(4097)] {
@@ -470,7 +476,7 @@ fn binding_nonce_is_unique_stable_private_and_required_to_match() {
         store.register_peer(PROJECT, "codex", "one", Some("Renamed"), "idle", NOW + 1).unwrap();
         assert_eq!(store.peer_binding_token("codex:one").unwrap(), token);
         let peer_json = serde_json::to_string(&store.peer("codex:one").unwrap()).unwrap();
-        let listing_json = serde_json::to_string(&store.peers(None, NOW, true).unwrap()).unwrap();
+        let listing_json = serde_json::to_string(&store.peers(None, NOW, true, true).unwrap()).unwrap();
         assert!(!peer_json.contains(&token));
         assert!(!peer_json.contains("binding_token"));
         assert!(!listing_json.contains(&token));

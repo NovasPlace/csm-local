@@ -98,15 +98,15 @@ fn install_status_rerun_and_uninstall() {
 
     let settings = fake.read_json(".claude/settings.json");
     assert_eq!(settings["theme"], "dark");
-    assert_eq!(settings["hooks"].as_object().unwrap().len(), 6);
+    assert_eq!(settings["hooks"].as_object().unwrap().len(), 9);
     let claude_json = fake.read_json(".claude.json");
     assert_eq!(claude_json["mcpServers"]["csm"]["args"], json!(["mcp"]));
     let codex_config = fs::read_to_string(fake.home().join(".codex").join("config.toml")).unwrap();
     assert!(codex_config.starts_with(config) && codex_config.contains("[mcp_servers.csm]"), "{codex_config}");
 
     let status = text(&fake.csm(&["setup", "--status"]));
-    assert!(status.contains("Claude Code: hooks 6/6 installed, MCP server registered"), "{status}");
-    assert!(status.contains("Codex: hooks 5/5 installed, MCP server registered"), "{status}");
+    assert!(status.contains("Claude Code: hooks 9/9 installed, MCP server registered"), "{status}");
+    assert!(status.contains("Codex: hooks 6/6 installed, MCP server registered"), "{status}");
 
     let again = text(&fake.csm(&["setup", "--yes"]));
     assert!(again.contains("Nothing to change."), "{again}");
@@ -116,7 +116,7 @@ fn install_status_rerun_and_uninstall() {
     assert_eq!(fake.read_json(".claude/settings.json"), json!({ "theme": "dark" }));
     assert_eq!(fs::read_to_string(fake.home().join(".codex").join("config.toml")).unwrap(), config);
     let status = text(&fake.csm(&["setup", "--status"]));
-    assert!(status.contains("Claude Code: hooks 0/6 installed, MCP server not registered"), "{status}");
+    assert!(status.contains("Claude Code: hooks 0/9 installed, MCP server not registered"), "{status}");
     let backups = fake.home().join(".csm").join("backups");
     assert!(fs::read_dir(&backups).unwrap().count() >= 1, "backups were written");
 }
@@ -234,7 +234,7 @@ fn installed_hooks_support_space_and_unicode_paths() {
         assert_eq!(fake.read_json(".codex/hooks.json"), codex_hooks);
         assert_eq!(fake.read_json(".claude/settings.json"), claude_hooks);
         let status = text(&run_setup(&["--status"]));
-        assert!(status.contains("hooks 6/6 installed") && status.contains("hooks 5/5 installed"), "{status}");
+        assert!(status.contains("hooks 9/9 installed") && status.contains("hooks 6/6 installed"), "{status}");
         let removed = run_setup(&["--uninstall", "--yes"]);
         assert!(removed.status.success(), "{}", text(&removed));
         assert_eq!(fake.read_json(".claude/settings.json"), settings);

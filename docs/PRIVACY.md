@@ -19,6 +19,12 @@ content the user or agent deliberately supplies. Common credential patterns are
 redacted, but redaction is best-effort and is not a guarantee that every secret
 will be recognized. Avoid saving secrets or confidential material unnecessarily.
 
+Each record also carries the name of the model the session was running as, when
+known: Codex names it in every hook event, and for Claude Code the hook reads it
+from the end of the session's own transcript file, which is where a model
+switched mid-session shows up. Only the model name is taken from the transcript;
+nothing else in it is read into the database.
+
 Opt-in messaging also stores session addresses, private connection tokens,
 message bodies, routing metadata, and delivery/acknowledgment timestamps in
 separate local tables. Message context reaches the recipient's model provider
@@ -37,8 +43,40 @@ writes, or checkpoint content. Disable/uninstall the CSM hooks to stop automatic
 capture entirely. Desktop apps may require a full exit and relaunch to inherit
 changed environment settings.
 
+When the user types a request, CSM can show the agent up to three earlier
+requests from other sessions in the same project that share its rarer words,
+with the reply each got and what the user said next, once per session. It can
+also show up to three of the project's saved memories that match the request,
+and, before an agent edits a file inside the project, up to three that name
+that file: each memory once per session, and again after the session compacts.
+That text goes to the agent's model provider like a briefing. When a reply
+reports a result after an unrun code change, or one like a result the user
+pushed back on, CSM sends the agent back once to say what it verified. Set
+`CSM_RECALL=0` or `CSM_CLAIM_CHECK=0` in the agent's environment to turn either
+off; `CSM_RECALL=0` turns off the earlier requests and both kinds of memory.
+
+When a session has taken four requests and changed code since it last saved a
+memory, a checkpoint or a decision, CSM sends the agent back once to save what a
+later session could not see in the code, or to say there is nothing; it then
+counts again from there. What the agent saves is its own writing, redacted like
+any other memory. The hooks note that a save happened, not what was saved. Set
+`CSM_SAVE_NUDGE=0` to turn it off.
+
+A project can have one project card, a memory of kind `card` of at most 1,000
+bytes that says what the project is and how to build, test and run it. Every
+briefing in that project opens with it, so it reaches the agent's model provider
+at each session start. Saving a new card writes over the last one; `csm delete`
+removes it.
+
+After a compaction or a resume, the briefing a session gets describes that
+session itself in place of the one before it: its last request and reply, up to
+two earlier requests, the project files it changed and its last commands, from
+the journal. That part has up to 1,500 bytes of its own on top of the briefing
+budget.
+
 Automatic journal records are pruned in bounded batches during session starts
-using 90-day and 5,000-event-per-project thresholds. This does not guarantee
+using 90-day and 5,000-event-per-project thresholds; requests and replies age
+out at 90 days and do not count toward the 5,000. This does not guarantee
 immediate deletion at a fixed age. Saved memories and agent-authored goals/checkpoints
 are retained until explicitly deleted. App-generated suggestion sessions remain
 in raw records but are filtered from briefings when their identifying prompts
@@ -59,7 +97,7 @@ $project = (Get-Location).Path
 ```
 
 Export is JSON for inspection and portability; this release has no import command.
-It includes memories and journal records, not mailbox tables. Use `peers`,
+It includes memories, journal records and decision board entries, not mailbox tables. Use `peers`,
 `inbox`, and `message-status` to inspect messaging. A database backup includes all
 tables, including retained message history.
 For a restorable database backup, stop agents and CSM processes and copy the data
@@ -75,8 +113,9 @@ directory as described in the recovery guide, or use a SQLite-aware backup tool.
 & $csm forget --project $project --yes
 ```
 
-This removes saved memories, checkpoints, journal events, messaging peers, and
-messages to or from that project in the selected database. Use version 0.2 or
+This removes saved memories, checkpoints, journal events, standing decisions,
+file claims, messaging peers, and messages to or from that project in the
+selected database. Use version 0.2 or
 later to include mailbox data. It does not erase exports, filesystem backups, agent
 transcripts or information already sent to a model provider. If CSM reports that
 database scrubbing was incomplete because another connection is busy, close the

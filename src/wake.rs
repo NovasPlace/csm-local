@@ -277,7 +277,14 @@ never reply just to acknowledge an acknowledgment or keep a conversation alive. 
 }
 
 /// Native Claude runs this as an asyncRewake Stop hook: only a real unread message exits 2.
-pub fn claude_watch(store: &Store, payload: &Value, timeout: Duration) -> Result<Option<String>> {
+/// It waits only while `host_alive` holds: once nothing can receive the exit, an
+/// orphaned watcher would hold the session's lease and take its next wake.
+pub fn claude_watch(
+    store: &Store,
+    payload: &Value,
+    timeout: Duration,
+    host_alive: impl Fn() -> bool,
+) -> Result<Option<String>> {
     if payload.get("agent_id").and_then(Value::as_str).is_some() || !store.wake_enabled()? {
         return Ok(None);
     }
@@ -294,7 +301,7 @@ pub fn claude_watch(store: &Store, payload: &Value, timeout: Duration) -> Result
     let started = Instant::now();
     let mut renew_at = now_ms() + 10_000;
     let result = (|| {
-        while started.elapsed() < timeout && store.wake_enabled()? {
+        while started.elapsed() < timeout && host_alive() && store.wake_enabled()? {
             if now_ms() >= renew_at {
                 if !store.watcher_lease(&peer, &owner, now_ms())? {
                     return Ok(None);
@@ -355,7 +362,8 @@ pub fn hook_main(args: &[String]) -> std::process::ExitCode {
             return Ok(None);
         }
         let store = Store::open(&db)?;
-        claude_watch(&store, &payload, Duration::from_secs(timeout))
+        let parent = parent::Watch::parent();
+        claude_watch(&store, &payload, Duration::from_secs(timeout), || parent.alive())
     })();
     match result {
         Ok(Some(prompt)) => {
@@ -379,6 +387,228 @@ pub fn spawn_daemon(db: &Path) -> Result<()> {
     let _stdio_guard = no_inherited_stdio::suppress()?;
     command.spawn()?;
     Ok(())
+}
+
+/// The processes a hook runs under. Hosts run hooks through a shell that
+/// waits for them (Claude Code on Windows uses Git Bash), so something can
+/// still read a hook's exit as long as its shells and the host above them run.
+/// On Windows a child outlives its parent, so a waiting hook has to look for itself.
+#[cfg(windows)]
+mod parent {
+    use std::ffi::c_void;
+    type Handle = *mut c_void;
+    const SNAP_PROCESSES: u32 = 0x2;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const WAIT_TIMEOUT: u32 = 0x102;
+
+    #[repr(C)]
+    struct ProcessEntry {
+        size: u32,
+        usage: u32,
+        pid: u32,
+        heap: usize,
+        module: u32,
+        threads: u32,
+        parent: u32,
+        priority: i32,
+        flags: u32,
+        exe: [u16; 260],
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> Handle;
+        fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
+        fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn GetCurrentProcess() -> Handle;
+        fn GetProcessTimes(
+            process: Handle,
+            created: *mut FileTime,
+            exited: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn WaitForSingleObject(handle: Handle, ms: u32) -> u32;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+
+    pub enum Watch {
+        /// No way to tell: wait as if it were there, as before this check.
+        Unknown,
+        Gone,
+        Running(Handle),
+        /// Alive while every one of them is.
+        All(Vec<Watch>),
+    }
+
+    impl Watch {
+        /// The shell that started this process, every shell above it, and the
+        /// first process above them that is not a shell: the host. Git Bash is
+        /// a launcher, `bin\bash.exe`, that runs the real shell,
+        /// `usr\bin\bash.exe`; a host that goes takes the launcher with it at
+        /// most, and the inner shell goes on waiting for the hook.
+        pub fn parent() -> Watch {
+            let Some(processes) = processes() else {
+                return Watch::Unknown;
+            };
+            let find = |pid: u32| processes.iter().find(|p| p.pid == pid);
+            let Some(me) = find(std::process::id()) else {
+                return Watch::Unknown;
+            };
+            let mut pid = me.parent;
+            // SAFETY: the pseudo-handle for this process needs no closing.
+            let mut born = created(unsafe { GetCurrentProcess() });
+            let mut chain = Vec::new();
+            for _ in 0..8 {
+                let watch = Watch::process(pid, Some(born));
+                let Watch::Running(handle) = &watch else {
+                    // A shell above one that is still waiting may have gone
+                    // before the hook started; wait on the ones still there.
+                    if chain.is_empty() {
+                        return watch;
+                    }
+                    break;
+                };
+                born = created(*handle);
+                chain.push(watch);
+                match find(pid).filter(|p| is_shell(&p.exe)) {
+                    Some(shell) => pid = shell.parent,
+                    None => break,
+                }
+            }
+            Watch::All(chain)
+        }
+
+        /// Process `pid`, as long as it started no later than `not_after`: a
+        /// later one reuses the number of a process that is gone.
+        pub fn process(pid: u32, not_after: Option<u64>) -> Watch {
+            // SAFETY: a null handle is checked; a valid one is owned by the
+            // Watch and closed in Drop.
+            let handle = unsafe { OpenProcess(SYNCHRONIZE | QUERY_LIMITED_INFORMATION, 0, pid) };
+            if handle.is_null() {
+                return Watch::Gone;
+            }
+            let watch = Watch::Running(handle);
+            if not_after.is_some_and(|limit| created(handle) > limit) {
+                return Watch::Gone;
+            }
+            watch
+        }
+
+        pub fn alive(&self) -> bool {
+            match self {
+                Watch::Unknown => true,
+                Watch::Gone => false,
+                // SAFETY: the handle stays open for the life of the Watch.
+                Watch::Running(handle) => unsafe { WaitForSingleObject(*handle, 0) == WAIT_TIMEOUT },
+                Watch::All(chain) => chain.iter().all(Watch::alive),
+            }
+        }
+    }
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            if let Watch::Running(handle) = self {
+                // SAFETY: closes the handle this Watch opened, once.
+                unsafe {
+                    CloseHandle(*handle);
+                }
+            }
+        }
+    }
+
+    struct Process {
+        pid: u32,
+        parent: u32,
+        exe: String,
+    }
+
+    /// Every process running now, or None if they cannot be listed.
+    fn processes() -> Option<Vec<Process>> {
+        // SAFETY: the snapshot handle is checked and closed here; entries
+        // are plain data sized as the API requires.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(SNAP_PROCESSES, 0);
+            if snapshot.is_null() || snapshot as isize == -1 {
+                return None;
+            }
+            let mut entry: ProcessEntry = std::mem::zeroed();
+            entry.size = std::mem::size_of::<ProcessEntry>() as u32;
+            let mut found = Vec::new();
+            let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+            while more {
+                let end = entry.exe.iter().position(|&c| c == 0).unwrap_or(entry.exe.len());
+                found.push(Process {
+                    pid: entry.pid,
+                    parent: entry.parent,
+                    exe: String::from_utf16_lossy(&entry.exe[..end]),
+                });
+                more = Process32NextW(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+            Some(found)
+        }
+    }
+
+    /// Programs a host runs hooks through, each waiting for what it started.
+    fn is_shell(exe: &str) -> bool {
+        ["bash.exe", "sh.exe", "cmd.exe", "powershell.exe", "pwsh.exe"].iter().any(|s| exe.eq_ignore_ascii_case(s))
+    }
+
+    /// When a process started, in 100 ns ticks; 0 if it cannot be read.
+    fn created(process: Handle) -> u64 {
+        let [mut created, mut exited, mut kernel, mut user]: [FileTime; 4] = Default::default();
+        // SAFETY: four valid out-pointers to FILETIME-shaped structs.
+        if unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+            return 0;
+        }
+        let FileTime { low, high } = created;
+        (u64::from(high) << 32) | u64::from(low)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::process::{Command, Stdio};
+
+        #[test]
+        fn a_watched_process_is_alive_until_it_exits() {
+            assert!(Watch::parent().alive(), "the test runner started this process");
+            let mut child =
+                Command::new("cmd").args(["/c", "ping -n 30 127.0.0.1"]).stdout(Stdio::null()).spawn().unwrap();
+            let watch = Watch::process(child.id(), None);
+            assert!(watch.alive());
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert!(!watch.alive());
+            assert!(!Watch::process(child.id(), Some(0)).alive(), "a number reused after the process is gone");
+        }
+    }
+}
+
+/// The process that started this one: once it has gone, the hook is reparented.
+#[cfg(not(windows))]
+mod parent {
+    pub struct Watch(u32);
+
+    impl Watch {
+        pub fn parent() -> Watch {
+            Watch(std::os::unix::process::parent_id())
+        }
+
+        pub fn alive(&self) -> bool {
+            self.0 != 1 && std::os::unix::process::parent_id() == self.0
+        }
+    }
 }
 
 #[cfg(windows)]

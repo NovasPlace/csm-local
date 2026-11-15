@@ -280,8 +280,8 @@ def verify_runtime(exe, base, skill, version, verify):
     installed = home / ".csm/bin/csm.exe"
     verify.check("installed_binary_matches_archive", installed.read_bytes() == exe.read_bytes())
     status = csm("setup_status", "setup", "--status", binary=installed)
-    verify.check("both_hosts_registered", "Claude Code: hooks 6/6 installed, MCP server registered" in status
-                 and "Codex: hooks 5/5 installed, MCP server registered" in status)
+    verify.check("both_hosts_registered", "Claude Code: hooks 9/9 installed, MCP server registered" in status
+                 and "Codex: hooks 6/6 installed, MCP server registered" in status)
     backup_root = home / ".csm/backups"
     backups = {p.relative_to(backup_root): p.read_bytes() for p in backup_root.rglob("*") if p.is_file()}
     verify.check("all_original_configs_backed_up", all(data in backups.values() for data in originals.values()))
@@ -314,10 +314,11 @@ def verify_runtime(exe, base, skill, version, verify):
     replies = csm("packaged_mcp_stdio", "mcp", "--project", str(project), binary=installed, input_bytes=wire)
     messages = {item["id"]: item for item in map(json.loads, replies.splitlines())}
     expected_tools = {"csm_save", "csm_search", "csm_list", "csm_delete", "csm_status", "csm_brief", "csm_checkpoint",
-                      "csm_connect", "csm_peers", "csm_send", "csm_inbox", "csm_ack", "csm_message_status", "csm_wait"}
+                      "csm_connect", "csm_peers", "csm_send", "csm_inbox", "csm_ack", "csm_message_status", "csm_wait",
+                      "csm_decide", "csm_decisions", "csm_claim", "csm_release"}
     verify.check("mcp_initialize_succeeds", messages[1]["result"]["serverInfo"]["version"] == version)
-    verify.check("mcp_exposes_exactly_fourteen_tools", {tool["name"] for tool in messages[2]["result"]["tools"]} == expected_tools
-                 and len(messages[2]["result"]["tools"]) == 14)
+    verify.check("mcp_exposes_exactly_eighteen_tools", {tool["name"] for tool in messages[2]["result"]["tools"]} == expected_tools
+                 and len(messages[2]["result"]["tools"]) == 18)
     result = messages[3]["result"]
     verify.check("mcp_recalls_unicode_checkpoint", not result.get("isError") and checkpoint in result["content"][0]["text"])
 
