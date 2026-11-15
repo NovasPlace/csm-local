@@ -163,3 +163,65 @@ fn a_wake_hook_waits_while_its_parent_runs_and_stops_when_it_is_gone() {
     drop(s);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Git Bash on Windows is a launcher that runs the real shell. When the host
+/// goes it takes the launcher at most, and the inner shell keeps waiting for
+/// the hook: on 11-14 four hooks sat that way holding leases of closed sessions.
+#[cfg(windows)]
+#[test]
+fn a_wake_hook_stops_when_the_outer_of_two_shells_is_gone() {
+    use std::time::Instant;
+    let tag = format!("csm-wake-shells-{}-{}", std::process::id(), now());
+    let root = std::env::temp_dir().join(&tag);
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("mail.db");
+    let s = Store::open(&db).unwrap();
+    s.register_peer("C:/qa", "claude", "orphan", None, "idle", now()).unwrap();
+    s.set_wake_enabled(true).unwrap();
+    let payload = root.join("payload.json");
+    std::fs::write(&payload, json!({"session_id":"orphan","hook_event_name":"Stop"}).to_string()).unwrap();
+    let hook = root.join("hook.cmd");
+    let line = format!(
+        "@\"{}\" --db \"{}\" wake-hook claude --timeout-seconds 60 < \"{}\"\r\n",
+        env!("CARGO_BIN_EXE_csm"),
+        db.display(),
+        payload.display()
+    );
+    std::fs::write(&hook, line).unwrap();
+    // This test is the host: the outer shell runs the inner one, which runs the hook.
+    let mut outer = Command::new("cmd")
+        .args(["/d", "/c", "cmd", "/d", "/c"])
+        .arg(&hook)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let left = || {
+        let script = format!(
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.Name -in 'cmd.exe','csm.exe' -and \
+             $_.CommandLine -like '*{tag}*' }} | ForEach-Object {{ $_.ProcessId }}"
+        );
+        let out =
+            Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::to_owned).collect::<Vec<_>>()
+    };
+
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(s.watcher_alive("claude:orphan", now()).unwrap(), "the hook waits while its shells and host run");
+    outer.kill().unwrap();
+    outer.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut behind = left();
+    while !behind.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        behind = left();
+    }
+    for pid in &behind {
+        let _ = Command::new("taskkill").args(["/PID", pid, "/F"]).output();
+    }
+    assert!(behind.is_empty(), "the inner shell and the hook outlived the outer shell: {behind:?}");
+    assert!(!s.watcher_alive("claude:orphan", now()).unwrap(), "and gave the lease up");
+    drop(s);
+    let _ = std::fs::remove_dir_all(root);
+}
