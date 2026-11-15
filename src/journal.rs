@@ -22,6 +22,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "test",
     "turn_end",
     "session_end",
+    "save",
     "checkpoint",
     "goal",
     "goal_done",
@@ -29,8 +30,10 @@ pub const EVENT_KINDS: &[&str] = &[
 
 /// Kinds recorded automatically by hooks. They age out; agent-authored
 /// kinds (checkpoint, goal, goal_done) stay until the project is forgotten.
+/// A `save` is the hook's note that a session saved something, not the thing
+/// saved.
 const PRUNABLE_KINDS: &str =
-    "'session_start','compact','prompt','edit','write','delete','command','test','turn_end','session_end'";
+    "'session_start','compact','prompt','edit','write','delete','command','test','turn_end','session_end','save'";
 pub const KEEP_EVENTS_PER_PROJECT: i64 = 5_000;
 pub const KEEP_DAYS: i64 = 90;
 const PRUNE_BATCH: i64 = 1_000;
@@ -62,6 +65,8 @@ pub struct NewEvent {
     pub ok: Option<bool>,
     pub detail: Option<String>,
     pub dedup_key: Option<String>,
+    /// The model the session was running as, when known.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,6 +82,7 @@ pub struct Event {
     pub files: Vec<String>,
     pub ok: Option<bool>,
     pub detail: Option<String>,
+    pub model: Option<String>,
     #[serde(skip)]
     pub ts: i64,
     pub at: String,
@@ -118,6 +124,7 @@ pub struct Checkpoint {
     pub blockers: Vec<String>,
     pub goal: Option<String>,
     pub goal_done: bool,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,7 +160,8 @@ fn suggestion_filter(exclude: bool) -> &'static str {
     }
 }
 
-const EVENT_COLUMNS: &str = "id, project, host, session_id, agent_id, kind, tool, summary, files, ok, detail, ts";
+const EVENT_COLUMNS: &str =
+    "id, project, host, session_id, agent_id, kind, tool, summary, files, ok, detail, ts, model";
 
 fn row_to_event(r: &Row) -> rusqlite::Result<Event> {
     let files: String = r.get(8)?;
@@ -170,6 +178,7 @@ fn row_to_event(r: &Row) -> rusqlite::Result<Event> {
         files: files.lines().filter(|l| !l.is_empty()).map(str::to_string).collect(),
         ok: r.get::<_, Option<i64>>(9)?.map(|v| v != 0),
         detail: r.get(10)?,
+        model: r.get(12)?,
         ts,
         at: iso(ts),
     })
@@ -208,8 +217,8 @@ impl Store {
         }
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO events
-                 (project, host, session_id, agent_id, kind, tool, summary, files, ok, detail, dedup_key, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 (project, host, session_id, agent_id, kind, tool, summary, files, ok, detail, dedup_key, ts, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 e.project,
                 e.host,
@@ -222,7 +231,8 @@ impl Store {
                 e.ok,
                 detail,
                 e.dedup_key,
-                ts
+                ts,
+                e.model.as_deref().and_then(crate::model::clean)
             ],
         )?;
         Ok((n > 0).then(|| self.conn.last_insert_rowid()))
@@ -464,6 +474,38 @@ impl Store {
         Ok(true)
     }
 
+    /// Whether something the session (or its subagent `agent_id`) was given
+    /// at or after `since` cites `source`, as a briefing cites `memory:<id>`.
+    pub fn was_given(&self, host: &str, session_id: &str, agent_id: &str, source: &str, since: i64) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM injections
+                           WHERE host = ?1 AND session_id = ?2 AND agent_id = ?3 AND ts >= ?4
+                             AND instr(' ' || sources || ' ', ' ' || ?5 || ' '))",
+            params![host, session_id, agent_id, since, source],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// When the session (or its subagent `agent_id`) was last given `trigger`.
+    pub fn injected_at(&self, host: &str, session_id: &str, agent_id: &str, trigger: &str) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(ts) FROM injections WHERE host = ?1 AND session_id = ?2 AND agent_id = ?3 AND trigger = ?4",
+            params![host, session_id, agent_id, trigger],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// When a memory or a checkpoint was last saved in `project`, by anyone.
+    pub fn last_saved(&self, project: &str) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(at) FROM (SELECT MAX(created_at) AS at FROM memories WHERE project = ?1
+                                  UNION ALL
+                                  SELECT MAX(ts) FROM events WHERE project = ?1 AND kind = 'checkpoint')",
+            [project],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Size of the most recent briefing injection, for `csm status`.
     pub fn last_injection(&self) -> Result<Option<(String, i64, i64)>> {
         Ok(self
@@ -471,6 +513,7 @@ impl Store {
             .query_row(
                 "SELECT host, bytes, ts FROM injections
                  WHERE trigger NOT LIKE 'lease:%' AND trigger NOT LIKE 'recall:%' AND trigger NOT LIKE 'claim:%'
+                   AND trigger NOT LIKE 'nudge:%'
                  ORDER BY id DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -544,6 +587,7 @@ impl Store {
             kind: kind.into(),
             summary,
             detail,
+            model: c.model.clone(),
             ..Default::default()
         };
         let tx = self.immediate()?;

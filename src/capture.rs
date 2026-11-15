@@ -180,6 +180,36 @@ pub fn tool_event(host: Host, payload: &Value, roots: &[String], failed: bool) -
     Some(event)
 }
 
+/// A shell command that runs csm's command line to save something.
+static SAVE_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)csm\w*(?:\.exe)?["']?\s+(?:--db\s+\S+\s+)?(save|checkpoint|decide)\b"#).unwrap()
+});
+
+/// What a tool call saved for later sessions, if it saved anything: a
+/// memory, a checkpoint or a standing decision, through csm's tools or its
+/// command line.
+pub fn saved(payload: &Value) -> Option<&'static str> {
+    let tool = payload.get("tool_name")?.as_str()?;
+    let named = |name: &str| tool == name || tool.strip_suffix(name).is_some_and(|server| server.ends_with("__"));
+    if let Some(name) = ["csm_save", "csm_checkpoint", "csm_decide"].into_iter().find(|name| named(name)) {
+        return Some(name);
+    }
+    if !matches!(tool, "Bash" | "PowerShell" | "shell" | "exec_command" | "local_shell") {
+        return None;
+    }
+    let input = payload.get("tool_input")?;
+    let command = match input.get("command").or_else(|| input.get("cmd"))? {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+        _ => return None,
+    };
+    match SAVE_COMMAND.captures(&command)?.get(1)?.as_str().to_ascii_lowercase().as_str() {
+        "save" => Some("csm save"),
+        "checkpoint" => Some("csm checkpoint"),
+        _ => Some("csm decide"),
+    }
+}
+
 /// csm's own MCP tools, under any server alias that contains "csm".
 pub fn is_own_tool(tool: &str) -> bool {
     tool.starts_with("mcp__csm__") || (tool.starts_with("mcp__") && tool.contains("_csm__"))
@@ -664,6 +694,30 @@ mod tests {
         assert!(event(Host::Claude, &claude("Edit", json!({})), false).is_none());
         assert!(event(Host::Claude, &claude("Bash", json!({ "command": "   " })), false).is_none());
         assert!(event(Host::Claude, &json!({}), false).is_none());
+    }
+
+    #[test]
+    fn saved_names_what_a_tool_call_kept_for_later_sessions() {
+        let tool = |name: &str| json!({ "tool_name": name, "tool_input": { "content": "x" } });
+        assert_eq!(saved(&tool("mcp__csm__csm_save")), Some("csm_save"));
+        assert_eq!(saved(&tool("mcp__my_csm__csm_checkpoint")), Some("csm_checkpoint"));
+        assert_eq!(saved(&tool("csm_decide")), Some("csm_decide"));
+        for other in ["mcp__csm__csm_search", "mcp__csm__csm_brief", "mcp__other__not_csm_save", "Edit"] {
+            assert!(saved(&tool(other)).is_none(), "{other}");
+        }
+
+        let shell = |tool: &str, command: &str| json!({ "tool_name": tool, "tool_input": { "command": command } });
+        assert_eq!(saved(&shell("Bash", "csm save 'LTO is needed' --kind lesson")), Some("csm save"));
+        let skill = "& $csmExe checkpoint 'Hooks wired' --project $csmProject";
+        assert_eq!(saved(&shell("PowerShell", skill)), Some("csm checkpoint"));
+        let full = "\"C:/Users/me/.csm/bin/csm.exe\" --db C:/tmp/x.db decide 'saves do not matter'";
+        assert_eq!(saved(&shell("Bash", full)), Some("csm decide"));
+        for other in ["csm search lto", "csm status", "cargo test save", "echo csm_save"] {
+            assert!(saved(&shell("Bash", other)).is_none(), "{other}");
+        }
+        let patch = "*** Update File: docs/USAGE.md\n+run csm save to keep it";
+        assert!(saved(&shell("apply_patch", patch)).is_none(), "a patch is not a shell");
+        assert!(saved(&json!({})).is_none());
     }
 
     #[test]

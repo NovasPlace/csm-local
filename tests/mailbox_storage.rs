@@ -58,6 +58,7 @@ fn memory() -> NewMemory {
         tags: vec![],
         importance: 3,
         source: None,
+        model: None,
     }
 }
 

@@ -180,6 +180,7 @@ mod tests {
                 tags: vec![],
                 importance: 3,
                 source: None,
+                model: None,
             })
             .unwrap();
 

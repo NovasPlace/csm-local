@@ -25,7 +25,7 @@ pub const MAX_DECISION_BYTES: usize = 300;
 pub const MAX_SHOWN: usize = 8;
 /// A session's "seen up to" marker is dropped this long after it last moved.
 const KEEP_SEEN_MS: i64 = 30 * 86_400_000;
-const COLUMNS: &str = "id, project, text, withdraws, recorded_by, ts";
+const COLUMNS: &str = "id, project, text, withdraws, recorded_by, ts, model";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Decision {
@@ -37,6 +37,8 @@ pub struct Decision {
     pub withdraws: Option<i64>,
     /// `cli`, `mcp`, or the messaging peer that recorded it (`codex:<session>`).
     pub recorded_by: String,
+    /// The model the recording session was running as, when known.
+    pub model: Option<String>,
     pub recorded_at: String,
     #[serde(skip)]
     pub ts: i64,
@@ -132,6 +134,19 @@ CREATE TABLE IF NOT EXISTS csm_decisions_seen (
         recorded_by: &str,
         now: i64,
     ) -> Result<Decided> {
+        self.decide_as(project, text, withdraw, recorded_by, None, now)
+    }
+
+    /// As [`Store::decide`], by a session running as `model`.
+    pub fn decide_as(
+        &self,
+        project: &str,
+        text: Option<&str>,
+        withdraw: Option<i64>,
+        recorded_by: &str,
+        model: Option<&str>,
+        now: i64,
+    ) -> Result<Decided> {
         let (text, redacted) = match text {
             Some(text) => {
                 let (text, redacted) = clean_decision(text)?;
@@ -157,8 +172,9 @@ CREATE TABLE IF NOT EXISTS csm_decisions_seen (
             }
         }
         tx.execute(
-            "INSERT INTO csm_decisions (project, text, withdraws, recorded_by, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![project, text.unwrap_or_default(), withdraw, recorded_by, now],
+            "INSERT INTO csm_decisions (project, text, withdraws, recorded_by, ts, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![project, text.unwrap_or_default(), withdraw, recorded_by, now, model.and_then(crate::model::clean)],
         )?;
         let id = tx.last_insert_rowid();
         let entry = self.decision(id)?.expect("decision inserted in this transaction");
@@ -349,6 +365,7 @@ fn row_to_decision(r: &Row<'_>) -> rusqlite::Result<Decision> {
         text: r.get(2)?,
         withdraws: r.get(3)?,
         recorded_by: r.get(4)?,
+        model: r.get(6)?,
         recorded_at: iso(ts),
         ts,
     })

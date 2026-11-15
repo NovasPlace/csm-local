@@ -35,7 +35,7 @@ const MAX_NOTE_BYTES: usize = 200;
 /// Claims one session can hold at once.
 const MAX_HELD: i64 = 100;
 const MINUTE_MS: i64 = 60_000;
-const COLUMNS: &str = "id, display, project, peer, note, claimed_at, expires_at, agent_id";
+const COLUMNS: &str = "id, display, project, peer, note, claimed_at, expires_at, agent_id, model";
 /// A claim is in force until it expires or its session ends, and not while
 /// the subagent holding it is stopped.
 const IN_FORCE: &str =
@@ -62,6 +62,9 @@ pub struct Claim {
     /// The holder's subagent that claimed it; empty for the session itself,
     /// [`UNATTRIBUTED`] before the hook has said.
     pub agent_id: String,
+    /// The model the holder's session was running as when it last claimed
+    /// the file, when known.
+    pub model: Option<String>,
 }
 
 impl Claim {
@@ -260,17 +263,29 @@ CREATE INDEX IF NOT EXISTS csm_file_claims_peer ON csm_file_claims (peer);
                         "UPDATE csm_file_claims
                          SET expires_at = CASE WHEN ?4 IS NULL THEN MAX(expires_at, ?2) ELSE ?2 END,
                              note = CASE WHEN ?3 = '' OR (?4 IS NULL AND note <> '') THEN note ELSE ?3 END,
-                             agent_id = COALESCE(?4, agent_id)
+                             agent_id = COALESCE(?4, agent_id),
+                             model = COALESCE(?5, model)
                          WHERE id = ?1",
-                        params![mine.id, expires, note, holder],
+                        params![mine.id, expires, note, holder, peer.model],
                     )?;
                     mine.id
                 }
                 None => {
                     tx.execute(
-                        "INSERT INTO csm_file_claims (path, display, project, peer, note, claimed_at, expires_at, agent_id)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        params![key, path, peer.project, peer.id, note, now, expires, holder.unwrap_or(UNATTRIBUTED)],
+                        "INSERT INTO csm_file_claims
+                             (path, display, project, peer, note, claimed_at, expires_at, agent_id, model)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            key,
+                            path,
+                            peer.project,
+                            peer.id,
+                            note,
+                            now,
+                            expires,
+                            holder.unwrap_or(UNATTRIBUTED),
+                            peer.model
+                        ],
                     )?;
                     tx.last_insert_rowid()
                 }
@@ -452,6 +467,7 @@ fn row_to_claim(r: &Row<'_>) -> rusqlite::Result<Claim> {
         claimed_at: r.get(5)?,
         expires_at: r.get(6)?,
         agent_id: r.get(7)?,
+        model: r.get(8)?,
     })
 }
 

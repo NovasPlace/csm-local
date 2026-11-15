@@ -27,7 +27,7 @@ enum Command {
     /// Save a memory for the current project
     Save {
         content: String,
-        /// note, lesson, decision or fact
+        /// note, lesson, decision, fact, or card (the one project card every briefing opens with)
         #[arg(long, default_value = "note")]
         kind: String,
         /// Comma-separated tags
@@ -492,9 +492,12 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Save { content, kind, tags, importance, project } => {
             let project = resolve_project(&store, project)?;
-            let saved = store.save(NewMemory { project, kind, content, tags, importance, source: None })?;
+            let saved =
+                store.save(NewMemory { project, kind, content, tags, importance, source: None, model: None })?;
             if saved.duplicate {
                 println!("Already saved as #{}.", saved.memory.id);
+            } else if saved.replaced {
+                println!("Saved #{}, in place of the last card.", saved.memory.id);
             } else {
                 println!("Saved #{}.", saved.memory.id);
             }
@@ -534,8 +537,14 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Brief { project, budget, explain } => {
             let project = resolve_project(&store, project)?;
-            let request =
-                BriefRequest { project: &project, current_session: None, exclude_active: true, budget, now: now_ms() };
+            let request = BriefRequest {
+                project: &project,
+                current_session: None,
+                exclude_active: true,
+                resumed: false,
+                budget,
+                now: now_ms(),
+            };
             match brief::build(&store, &request)? {
                 Some(b) => {
                     println!("{}", b.text);
@@ -597,6 +606,7 @@ fn run(cli: Cli) -> Result<()> {
                 blockers: blocker,
                 goal,
                 goal_done,
+                model: None,
             })?;
             println!("Checkpoint #{} recorded.", result.checkpoint_id);
             if let Some(closed) = result.closed_goal {

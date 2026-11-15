@@ -13,6 +13,7 @@ pub mod leases;
 pub mod links;
 pub mod mcp;
 pub mod messaging;
+pub mod model;
 pub mod paths;
 pub mod project;
 pub mod recall;

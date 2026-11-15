@@ -18,7 +18,7 @@ pub const PEER_STALE_MS: i64 = 10 * 60 * 1000;
 /// A session silent this long is listed only with the ended ones.
 pub const PEER_GONE_MS: i64 = 24 * 60 * 60 * 1000;
 const MINUTE_MS: i64 = 60 * 1000;
-const PEER_COLUMNS: &str = "id, project, host, session_id, label, state, last_seen";
+const PEER_COLUMNS: &str = "id, project, host, session_id, label, state, last_seen, model";
 const MESSAGE_COLUMNS: &str =
     "id, from_peer, to_peer, content, created_at, expires_at, delivered_at, acknowledged_at, reply_to";
 
@@ -31,6 +31,8 @@ pub struct Peer {
     pub label: String,
     pub state: String,
     pub last_seen: i64,
+    /// The model the session is running as now, when known.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -498,6 +500,7 @@ fn row_to_peer(r: &Row<'_>) -> rusqlite::Result<Peer> {
         label: r.get(4)?,
         state: r.get(5)?,
         last_seen: r.get(6)?,
+        model: r.get(7)?,
     })
 }
 

@@ -49,6 +49,11 @@ The setup status confirms configuration, not successful live delivery.
 The session hook gives the agent its exact host, session ID, and private binding
 token. `csm_connect` binds that MCP process to that identity; it cannot then
 switch to another identity. The token is absent from peer discovery and messages.
+`csm_connect` also takes the agent's model ID. What a connected session saves,
+checkpoints, decides and claims is recorded with the model it was running as at
+the time, and `csm_peers` lists each session's current model. The session's
+hooks correct it whenever the host shows which model is answering, so a model
+switched mid-session is picked up without connecting again.
 
 1. Connect with the identity supplied by the session hook.
 2. Use `csm_peers` to select a specific recipient, optionally naming your own

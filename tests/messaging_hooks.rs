@@ -15,6 +15,7 @@ fn env() -> HookEnv {
         codex_app_pipe: None,
         claim_check: true,
         recall: true,
+        save_nudge: true,
     }
 }
 

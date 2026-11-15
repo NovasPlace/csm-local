@@ -8,8 +8,13 @@ use crate::redact::redact;
 use crate::time::{iso, now_ms};
 use crate::{Error, Result};
 
-pub const KINDS: &[&str] = &["note", "lesson", "decision", "fact"];
+pub const KINDS: &[&str] = &["note", "lesson", "decision", "fact", "card"];
 pub const MAX_CONTENT_CHARS: usize = 20_000;
+/// The project card: what the project is, where things live, how to build,
+/// test and run it. One per project, shown first in every briefing, so it is
+/// kept short; a longer one is refused rather than cut.
+pub const CARD: &str = "card";
+pub const MAX_CARD_BYTES: usize = 1_000;
 
 /// Applied in order; `PRAGMA user_version` records how many have run. Kinds
 /// are validated in Rust rather than with CHECK constraints so adding one
@@ -90,7 +95,7 @@ INSERT INTO memories_fts (memories_fts) VALUES ('optimize');
 ",
 ];
 
-const COLUMNS: &str = "m.id, m.project, m.kind, m.content, m.tags, m.importance, m.source, m.created_at";
+const COLUMNS: &str = "m.id, m.project, m.kind, m.content, m.tags, m.importance, m.source, m.created_at, m.model";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Memory {
@@ -102,6 +107,8 @@ pub struct Memory {
     pub importance: i64,
     pub source: Option<String>,
     pub created_at: String,
+    /// The model the session that saved it was running as, when known.
+    pub model: Option<String>,
 }
 
 impl Memory {
@@ -125,6 +132,7 @@ pub struct NewMemory {
     pub tags: Vec<String>,
     pub importance: i64,
     pub source: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +140,8 @@ pub struct Saved {
     pub memory: Memory,
     pub duplicate: bool,
     pub redacted: usize,
+    /// Whether this was written over the project's last card.
+    pub replaced: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,6 +220,7 @@ impl Store {
         store.init_coordination()?;
         store.init_decisions()?;
         store.init_claims()?;
+        store.init_models()?;
         Ok(store)
     }
 
@@ -262,6 +273,13 @@ impl Store {
         if trimmed.chars().count() > MAX_CONTENT_CHARS {
             return Err(Error::Invalid(format!("content is longer than {MAX_CONTENT_CHARS} characters")));
         }
+        if new.kind == CARD && trimmed.len() > MAX_CARD_BYTES {
+            return Err(Error::Invalid(format!(
+                "a project card is at most {MAX_CARD_BYTES} bytes and this is {}; keep what a new session needs \
+                 first and save the rest as separate memories",
+                trimmed.len()
+            )));
+        }
 
         let content = redact(trimmed);
         let tags = redact(&normalize_tags(&new.tags).join(","));
@@ -270,28 +288,58 @@ impl Store {
 
         let hash = content_hash(&content.text);
         let tx = self.immediate()?;
-        if let Some(existing) = self.find_duplicate(&new.project, &hash, &content.text)? {
-            return Ok(Saved { memory: existing, duplicate: true, redacted });
+        // The same words saved earlier as a note are not yet the card.
+        let existing = self.find_duplicate(&new.project, &hash, &content.text)?;
+        if let Some(existing) = existing.filter(|m| new.kind != CARD || m.kind == CARD) {
+            return Ok(Saved { memory: existing, duplicate: true, redacted, replaced: false });
         }
-
-        tx.execute(
-            "INSERT INTO memories (project, kind, content, tags, importance, source, content_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                new.project,
-                new.kind,
-                content.text,
-                tags.text,
-                new.importance,
-                source.map(|s| s.text),
-                hash,
-                now_ms()
-            ],
-        )?;
-        let id = tx.last_insert_rowid();
+        // A project has one card: a new one is written over the last, which
+        // keeps its number. A deleted row's number would be handed out again.
+        let card = if new.kind == CARD { self.card(&new.project)?.map(|card| card.id) } else { None };
+        let source = source.map(|s| s.text);
+        let model = new.model.as_deref().and_then(crate::model::clean);
+        let id = match card {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE memories SET content = ?2, tags = ?3, importance = ?4, source = ?5, content_hash = ?6,
+                                         created_at = ?7, model = ?8
+                     WHERE id = ?1",
+                    params![id, content.text, tags.text, new.importance, source, hash, now_ms(), model],
+                )?;
+                id
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO memories
+                         (project, kind, content, tags, importance, source, content_hash, created_at, model)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        new.project,
+                        new.kind,
+                        content.text,
+                        tags.text,
+                        new.importance,
+                        source,
+                        hash,
+                        now_ms(),
+                        model
+                    ],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
         let memory = self.get(id)?.ok_or_else(|| Error::Invalid(format!("memory #{id} vanished after insert")))?;
         tx.commit()?;
-        Ok(Saved { memory, duplicate: false, redacted })
+        Ok(Saved { memory, duplicate: false, redacted, replaced: card.is_some() })
+    }
+
+    /// The project's card, if it has one.
+    pub fn card(&self, project: &str) -> Result<Option<Memory>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM memories m WHERE m.project = ?1 AND m.kind = ?2 ORDER BY m.id DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query_map(params![project, CARD], row_to_memory)?;
+        Ok(rows.next().transpose()?)
     }
 
     fn find_duplicate(&self, project: &str, hash: &str, content: &str) -> Result<Option<Memory>> {
@@ -331,7 +379,7 @@ impl Store {
              LIMIT ?4"
         ))?;
         let rows = stmt.query_map(params![fts, filter.project, filter.kind, (limit * 4) as i64], |r| {
-            Ok((row_to_memory(r)?, r.get::<_, f64>(8)?))
+            Ok((row_to_memory(r)?, r.get::<_, f64>(9)?))
         })?;
         let mut hits = Vec::new();
         for row in rows {
@@ -347,15 +395,30 @@ impl Store {
         Ok(hits)
     }
 
-    /// Decisions, lessons and anything marked important, most important first.
+    /// Decisions, lessons and anything marked important, most important
+    /// first. Not the card, which a briefing shows on its own.
     pub fn key_memories(&self, project: &str, limit: usize) -> Result<Vec<Memory>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM memories m
-             WHERE m.project = ?1 AND (m.kind IN ('decision', 'lesson') OR m.importance >= 4)
+             WHERE m.project = ?1 AND m.kind <> 'card' AND (m.kind IN ('decision', 'lesson') OR m.importance >= 4)
              ORDER BY m.importance DESC, m.created_at DESC, m.id DESC
              LIMIT ?2"
         ))?;
         let rows = stmt.query_map(params![project, limit as i64], row_to_memory)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Memories whose content, source or tags contain `text`, ASCII case
+    /// aside, most important first.
+    pub fn memories_containing(&self, project: &str, text: &str, limit: usize) -> Result<Vec<Memory>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM memories m
+             WHERE m.project = ?1
+               AND (instr(lower(m.content), ?2) OR instr(lower(coalesce(m.source, '')), ?2) OR instr(lower(m.tags), ?2))
+             ORDER BY m.importance DESC, m.created_at DESC, m.id DESC
+             LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![project, text.to_ascii_lowercase(), limit as i64], row_to_memory)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -504,6 +567,7 @@ fn row_to_memory(r: &Row) -> rusqlite::Result<Memory> {
         importance: r.get(5)?,
         source: r.get(6)?,
         created_at: iso(r.get(7)?),
+        model: r.get(8)?,
     })
 }
 
@@ -561,6 +625,7 @@ mod tests {
             tags: vec![],
             importance: 3,
             source: None,
+            model: None,
         }
     }
 
@@ -784,5 +849,37 @@ mod tests {
         assert_eq!(store.stats(None).unwrap().schema_version, MIGRATIONS.len() as i64);
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_project_has_one_card_and_a_new_one_takes_its_place() {
+        let store = Store::open_in_memory().unwrap();
+        let first = store.save(new(P, "card", "A CLI in Rust. Build: cargo build.")).unwrap();
+        assert!(!first.duplicate && !first.replaced);
+        let again = store.save(new(P, "card", "A CLI in Rust. Build: cargo build.")).unwrap();
+        assert!(again.duplicate && again.memory.id == first.memory.id);
+
+        store.save(new(P, "note", "Tests: cargo test -q.")).unwrap();
+        let second = store.save(new(P, "card", "Tests: cargo test -q.")).unwrap();
+        assert_eq!((second.duplicate, second.replaced), (false, true), "a note with its words is not the card");
+        assert_eq!(second.memory.id, first.memory.id, "the card keeps its number");
+        let cards = store.list(Filter { project: Some(P), kind: Some("card"), limit: 10 }).unwrap();
+        assert_eq!(cards.iter().map(|c| c.content.as_str()).collect::<Vec<_>>(), ["Tests: cargo test -q."]);
+        assert!(store.search("rust", all(Some(P))).unwrap().is_empty(), "the old words are not found any more");
+        assert_eq!(store.search("cargo", all(Some(P))).unwrap().len(), 2, "the new ones are: the card and the note");
+
+        assert!(store.card(OTHER).unwrap().is_none(), "per project");
+        store.save(new(OTHER, "card", "Another project.")).unwrap();
+        assert_eq!(store.card(P).unwrap().unwrap().content, "Tests: cargo test -q.", "each project has its own");
+
+        let long = store.save(new(P, "card", &"a".repeat(MAX_CARD_BYTES + 1))).unwrap_err().to_string();
+        assert!(long.contains("at most 1000 bytes and this is 1001"), "{long}");
+        assert_eq!(store.card(P).unwrap().unwrap().content, "Tests: cargo test -q.", "a refused card changes nothing");
+
+        // A briefing shows the card on its own, not among the key memories.
+        let mut important = new(P, "card", "Important card.");
+        important.importance = 5;
+        store.save(important).unwrap();
+        assert!(store.key_memories(P, 10).unwrap().iter().all(|m| m.kind != "card"));
     }
 }

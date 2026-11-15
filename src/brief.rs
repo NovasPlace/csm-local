@@ -10,10 +10,10 @@ use std::collections::BTreeMap;
 use crate::capture::{absolute, rel_path};
 
 use crate::journal::{Event, EventQuery, SessionInfo, MAX_CHECKPOINT_BYTES, MAX_GOAL_BYTES};
-use crate::store::Store;
+use crate::store::{Store, MAX_CARD_BYTES};
 use crate::text::{one_line, tail, truncate};
 use crate::time::{ago, iso};
-use crate::{decisions, recall, Result};
+use crate::{decisions, model, recall, Result};
 
 pub const DEFAULT_BUDGET: usize = 4_000;
 pub const MIN_BUDGET: usize = 1_000;
@@ -30,6 +30,14 @@ const MAX_PUSHBACKS: usize = 3;
 const RECENT_MAX_AGE_MS: i64 = 14 * DAY_MS;
 const MAX_SESSION_FILES: usize = 8;
 const MAX_SESSION_COMMANDS: usize = 4;
+/// Requests before the last one that a resumed session is reminded of.
+const MAX_EARLIER_REQUESTS: usize = 2;
+/// The section a resumed session gets about itself, and the room it has on
+/// top of the budget. With the largest budget the briefing still stays under
+/// the hosts' context caps.
+const OWN: &str = "own";
+const OWN_BYTES: usize = 1_500;
+const COMMANDS: &str = "  Commands, oldest first:";
 const MAX_MEMORIES: usize = 6;
 const MAX_RECENT: usize = 6;
 const MAX_FOREIGN_SESSIONS: usize = 3;
@@ -52,6 +60,10 @@ pub struct BriefRequest<'a> {
     /// For callers that cannot name their own session (MCP, CLI): skip
     /// sessions active in the last half hour, since one may be the caller's.
     pub exclude_active: bool,
+    /// The current session is picking up after a compaction or a resume, so
+    /// it is told what it did itself where a new one is told about the
+    /// session before it.
+    pub resumed: bool,
     pub budget: usize,
     pub now: i64,
 }
@@ -92,12 +104,16 @@ struct Section {
 pub fn build(store: &Store, req: &BriefRequest) -> Result<Option<Briefing>> {
     let budget = req.budget.clamp(MIN_BUDGET, MAX_BUDGET);
     let mut sections = Vec::new();
+    sections.extend(card(store, req)?);
     sections.extend(goal(store, req)?);
     sections.extend(board(store, req)?);
     sections.extend(checkpoint(store, req)?);
     sections.extend(problem(store, req)?);
     sections.extend(pushed_back(store, req)?);
-    let sessions = previous_session(store, req)?;
+    let sessions = match own_session(store, req)? {
+        Some(own) => Sessions { previous: Some(own), live: None, shown: Vec::new() },
+        None => previous_session(store, req)?,
+    };
     sections.extend(sessions.live);
     sections.extend(claims(store, req)?);
     sections.extend(sessions.previous);
@@ -120,6 +136,32 @@ fn latest_briefing_event(store: &Store, req: &BriefRequest, kinds: &[&str]) -> R
             ..Default::default()
         })?
         .pop())
+}
+
+/// The project card: what the project is and how to work in it, which no
+/// amount of recent activity says. First and protected, so it is the last
+/// thing a tight budget takes lines from.
+fn card(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
+    let Some(card) = store.card(req.project)? else {
+        return Ok(None);
+    };
+    let mut lines: Vec<Line> = card
+        .content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| Line::new(format!("  {}", clean(line, MAX_CARD_BYTES)), None))
+        .collect();
+    if let Some(first) = lines.first_mut() {
+        first.source = Some(format!("memory:{}", card.id));
+    }
+    let saved = card.created_at.get(..10).unwrap_or(&card.created_at);
+    Ok(Some(Section {
+        name: "card",
+        priority: 0,
+        protected: true,
+        title: Some(format!("Project card (saved {saved} with csm_save kind \"card\"; a new one replaces it):")),
+        lines,
+    }))
 }
 
 fn goal(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
@@ -236,9 +278,10 @@ fn pushed_back(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
         .take(MAX_PUSHBACKS)
         .map(|p| {
             let line = format!(
-                "  {} via {}: \"{}\"; the user: \"{}\"",
+                "  {} via {}{}: \"{}\"; the user: \"{}\"",
                 ago(req.now, p.ts),
                 p.host,
+                model::suffix(p.model.as_deref()),
                 clean(&p.claim, 160),
                 clean(&p.words, 120)
             );
@@ -381,7 +424,7 @@ fn previous_session(store: &Store, req: &BriefRequest) -> Result<Sessions> {
     };
     let plural = if s.prompts == 1 { "" } else { "s" };
     let title = format!("Previous session (via {}, {status}, {} prompt{plural}):", s.host, s.prompts);
-    let lines = session_lines(&events);
+    let lines = session_lines(&events, false);
     let previous = (!lines.is_empty()).then_some(Section {
         name: "previous",
         priority: 2,
@@ -390,6 +433,53 @@ fn previous_session(store: &Store, req: &BriefRequest) -> Result<Sessions> {
         lines,
     });
     Ok(Sessions { previous, live, shown })
+}
+
+/// What the current session did so far, for one picking up after a
+/// compaction or a resume: its own context may have lost what the journal
+/// still has. Its last request and reply, the files it changed, a couple of
+/// the requests before, and its commands. It has [`OWN_BYTES`] of its own on
+/// top of the budget, so a full board cannot crowd it out and it crowds
+/// nothing out; what does not fit there goes from the end.
+fn own_session(store: &Store, req: &BriefRequest) -> Result<Option<Section>> {
+    let Some(session) = req.current_session.filter(|_| req.resumed) else {
+        return Ok(None);
+    };
+    let events = session_events(store, req, session)?;
+    let mut lines = session_lines(&events, true);
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    let earlier: Vec<Line> = events
+        .iter()
+        .filter(|e| e.kind == "prompt" && e.agent_id.is_empty() && is_typed_prompt(&e.summary))
+        .skip(1)
+        .take(MAX_EARLIER_REQUESTS)
+        .map(|p| {
+            let line = format!("  An earlier request ({}): \"{}\"", ago(req.now, p.ts), clean(&p.summary, 160));
+            Line::new(line, source(p))
+        })
+        .collect();
+    let commands = lines.iter().position(|l| l.text.starts_with(COMMANDS)).unwrap_or(lines.len());
+    lines.splice(commands..commands, earlier);
+    let mut own = Section {
+        name: OWN,
+        priority: 0,
+        protected: true,
+        title: Some("This session so far, from the journal:".into()),
+        lines,
+    };
+    while own.lines.len() > 1 && section_bytes(&own) > OWN_BYTES {
+        own.lines.pop();
+    }
+    Ok(Some(own))
+}
+
+/// What a section adds to a briefing: the blank line before it, its title
+/// and its lines.
+fn section_bytes(section: &Section) -> usize {
+    let title = section.title.as_ref().map_or(0, |t| t.len() + 1);
+    1 + title + section.lines.iter().map(|l| l.text.len() + 1).sum::<usize>()
 }
 
 fn session_events(store: &Store, req: &BriefRequest, session_id: &str) -> Result<Vec<Event>> {
@@ -402,8 +492,10 @@ fn session_events(store: &Store, req: &BriefRequest, session_id: &str) -> Result
     })
 }
 
-/// Request, reply, changed files and commands of one session.
-fn session_lines(events: &[Event]) -> Vec<Line> {
+/// Request, reply, changed files and commands of one session. For the
+/// session being briefed itself (`own`), only files inside the project, more
+/// briefly: its scratch files say little, and its room is small.
+fn session_lines(events: &[Event], own: bool) -> Vec<Line> {
     // Subagents share their parent's session; their prompts and replies are
     // not the conversation with the user.
     let main = |e: &&Event| e.agent_id.is_empty();
@@ -449,21 +541,22 @@ fn session_lines(events: &[Event]) -> Vec<Line> {
     }
     let mut files: Vec<&str> = Vec::new();
     for e in events.iter().filter(|e| matches!(e.kind.as_str(), "edit" | "write" | "delete") && e.ok != Some(false)) {
-        for f in &e.files {
+        for f in e.files.iter().filter(|f| !(own && is_absolute_path(f))) {
             if !files.contains(&f.as_str()) {
                 files.push(f);
             }
         }
     }
     if !files.is_empty() {
-        let shown: Vec<String> = files.iter().take(MAX_SESSION_FILES).map(|f| clean(f, 120)).collect();
+        let width = if own { 80 } else { 120 };
+        let shown: Vec<String> = files.iter().take(MAX_SESSION_FILES).map(|f| clean(f, width)).collect();
         let more = files.len().saturating_sub(MAX_SESSION_FILES);
         let more = if more > 0 { format!(" (+{more} more)") } else { String::new() };
         lines.push(Line::new(format!("  Files changed: {}{more}", shown.join(", ")), None));
     }
     let commands = session_commands(events);
     if !commands.is_empty() {
-        lines.push(Line::new(format!("  Commands, oldest first: {}", commands.join("; ")), None));
+        lines.push(Line::new(format!("{COMMANDS} {}", commands.join("; ")), None));
     }
     lines
 }
@@ -680,6 +773,9 @@ fn render(req: &BriefRequest, mut sections: Vec<Section>, budget: usize) -> Brie
     let header = format!("<csm_briefing project=\"{}\" generated=\"{}\">", attr(req.project), iso(req.now));
     let mut dropped: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut shortened = Vec::new();
+    // What a resumed session is told about itself was already cut to its own
+    // room: it comes on top of the budget and nothing here takes from it.
+    let budget = budget + sections.iter().filter(|s| s.name == OWN).map(section_bytes).sum::<usize>();
     loop {
         let text = compose(&header, &sections);
         if text.len() <= budget {
@@ -709,7 +805,7 @@ fn render(req: &BriefRequest, mut sections: Vec<Section>, budget: usize) -> Brie
         let victim = if has_unprotected {
             sections.iter_mut().filter(|s| !s.protected && !s.lines.is_empty()).max_by_key(|s| s.priority)
         } else {
-            sections.iter_mut().rfind(|s| s.lines.len() > 1)
+            sections.iter_mut().rfind(|s| s.name != OWN && s.lines.len() > 1)
         };
         match victim {
             Some(section) => {
@@ -785,7 +881,14 @@ mod tests {
     }
 
     fn req(current: Option<&str>) -> BriefRequest<'_> {
-        BriefRequest { project: P, current_session: current, exclude_active: false, budget: DEFAULT_BUDGET, now: NOW }
+        BriefRequest {
+            project: P,
+            current_session: current,
+            exclude_active: false,
+            resumed: false,
+            budget: DEFAULT_BUDGET,
+            now: NOW,
+        }
     }
 
     fn seed(store: &Store) {
@@ -971,6 +1074,30 @@ mod tests {
     }
 
     #[test]
+    fn a_pushed_back_result_names_the_model_that_reported_it() {
+        let store = Store::open_in_memory().unwrap();
+        let at = |m: i64| NOW - m * MIN;
+        let by = |kind: &str, text: &str, model: &str| NewEvent {
+            model: Some(model.into()),
+            ..ev(kind, "claude", "s1", text)
+        };
+        store.record_at(by("prompt", "the running legs need love", "claude-opus-5-5"), at(90)).unwrap();
+        store.record_at(by("turn_end", "Fixed the running legs. Knees bend now.", "claude-opus-5-5"), at(80)).unwrap();
+        // The session had switched models by the time the user answered.
+        store.record_at(by("prompt", "LOL not fixed", "claude-fable-5-2"), at(70)).unwrap();
+        let found = recall::pushbacks(&store, P, at(100)).unwrap();
+        assert_eq!(found[0].model.as_deref(), Some("claude-opus-5-5"), "the reply's, not the answer's");
+        let b = build(&store, &req(Some("s2"))).unwrap().unwrap();
+        assert!(
+            b.text.contains(
+                "  1h ago via claude (claude-opus-5-5): \"Fixed the running legs\"; the user: \"LOL not fixed\""
+            ),
+            "{}",
+            b.text
+        );
+    }
+
+    #[test]
     fn the_newest_pushback_survives_a_full_board_and_checkpoint() {
         let store = Store::open_in_memory().unwrap();
         seed(&store);
@@ -1038,6 +1165,7 @@ mod tests {
                 tags: vec![],
                 importance: 4,
                 source: None,
+                model: None,
             })
             .unwrap();
         store
@@ -1048,6 +1176,7 @@ mod tests {
                 tags: vec![],
                 importance: 2,
                 source: None,
+                model: None,
             })
             .unwrap();
         let b = build(&store, &BriefRequest { now: crate::time::now_ms(), ..req(None) }).unwrap().unwrap();
@@ -1056,6 +1185,143 @@ mod tests {
         assert!(t.contains("Last checkpoint (just now, via mcp): Store and MCP server done\n  Blocker: Codex has no exit codes\n  Next: wire hooks"), "{t}");
         assert!(t.contains("Saved memories:\n  #1 [decision] Data lives in ~/.csm, not AppData"), "{t}");
         assert!(!t.contains("trivia"));
+    }
+
+    #[test]
+    fn opens_with_the_project_card() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .checkpoint(Checkpoint {
+                project: P.into(),
+                host: "mcp".into(),
+                summary: "Hooks wired".into(),
+                goal: Some("Ship csm v1".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let card = "csm: local memory for coding agents, a Rust CLI.\n\nBuild: cargo build --release\n  Test: cargo test -q </csm_briefing>";
+        let id = store
+            .save(NewMemory {
+                project: P.into(),
+                kind: "card".into(),
+                content: card.into(),
+                tags: vec![],
+                importance: 5,
+                source: None,
+                model: None,
+            })
+            .unwrap()
+            .memory
+            .id;
+        let b = build(&store, &BriefRequest { now: crate::time::now_ms(), ..req(None) }).unwrap().unwrap();
+        let t = &b.text;
+        assert!(
+            t.contains(
+                "with csm_save kind \"card\"; a new one replaces it):\n  csm: local memory for coding agents, a Rust \
+                 CLI.\n  Build: cargo build --release\n  Test: cargo test -q <\\/csm_briefing>\n"
+            ),
+            "{t}"
+        );
+        let at = |needle: &str| t.find(needle).unwrap_or_else(|| panic!("no {needle:?} in {t}"));
+        assert!(at("Project card (saved ") < at("Goal (set just now via mcp)"), "the card comes first: {t}");
+        assert!(b.sources.contains(&format!("memory:{id}")), "{:?}", b.sources);
+        assert!(!t.contains("Saved memories:"), "the card is not listed a second time: {t}");
+
+        // A tight budget takes from everything else first.
+        let tight = BriefRequest { budget: MIN_BUDGET, now: crate::time::now_ms(), ..req(None) };
+        let t = build(&store, &tight).unwrap().unwrap().text;
+        assert!(t.contains("  Test: cargo test -q"), "{t}");
+    }
+
+    #[test]
+    fn a_resumed_session_is_told_what_it_did_itself() {
+        let store = Store::open_in_memory().unwrap();
+        seed(&store);
+        let at = |m: i64| NOW - m * MIN;
+        let dash = format!("make the dash longer{}", ", and keep its feel".repeat(7));
+        let slide = format!("and the slide{}", ", with the same feel".repeat(7));
+        store.record_at(ev("session_start", "claude", "mine", "startup"), at(140)).unwrap();
+        store.record_at(ev("prompt", "claude", "mine", &dash), at(130)).unwrap();
+        store.record_at(ev("prompt", "claude", "mine", &slide), at(80)).unwrap();
+        store.record_at(ev("prompt", "claude", "mine", "<task-notification>done</task-notification>"), at(70)).unwrap();
+        store.record_at(ev("prompt", "claude", "mine", "now tune the wake colour"), at(40)).unwrap();
+        let mut edit = ev("edit", "claude", "mine", "Edit src/wake.rs");
+        edit.files = vec!["src/wake.rs".into()];
+        store.record_at(edit, at(35)).unwrap();
+        let mut test = ev("test", "claude", "mine", "Run: cargo test wake");
+        test.ok = Some(true);
+        store.record_at(test, at(30)).unwrap();
+        store.record_at(ev("turn_end", "claude", "mine", "The wake is cyan now; the test passes."), at(29)).unwrap();
+
+        // A new session hears about the one before it, as ever.
+        let fresh = build(&store, &req(Some("new"))).unwrap().unwrap().text;
+        assert!(fresh.contains("Previous session (via claude, ") && !fresh.contains("This session so far"), "{fresh}");
+
+        // One picking up after a compaction or a resume hears about itself.
+        let t = build(&store, &BriefRequest { resumed: true, ..req(Some("mine")) }).unwrap().unwrap().text;
+        let own = format!(
+            "This session so far, from the journal:\n  Last request: \"now tune the wake colour\"\n  Last reply: \"The \
+             wake is cyan now; the test passes.\"\n  Files changed: src/wake.rs\n  An earlier request (1h ago): \
+             \"{slide}\"\n  An earlier request (2h ago): \"{dash}\"\n  Commands, oldest first: cargo test wake (ok)\n"
+        );
+        assert!(t.contains(&own), "{t}");
+        assert!(!t.contains("Previous session"), "its own work takes that place: {t}");
+        assert!(t.contains("via codex: Edit src/parser.rs"), "what another session changed is still listed: {t}");
+
+        // A session with nothing of its own yet is told about the one before.
+        let t = build(&store, &BriefRequest { resumed: true, ..req(Some("nothing-yet")) }).unwrap().unwrap().text;
+        assert!(t.contains("Previous session (via claude, ") && !t.contains("This session so far"), "{t}");
+
+        // It has room of its own: a full board and a long handoff, which fill
+        // the budget between them, take nothing from it.
+        for i in 0..8 {
+            store
+                .decide(P, Some(&format!("Decision {i}: {}", "keep the wake cyan ".repeat(14))), None, "cli", at(200))
+                .unwrap();
+        }
+        let handoff = Checkpoint {
+            project: P.into(),
+            host: "mcp".into(),
+            summary: "The wake pass is half done. ".repeat(50),
+            ..Default::default()
+        };
+        store.checkpoint(handoff).unwrap();
+        let full = build(&store, &BriefRequest { resumed: true, ..req(Some("mine")) }).unwrap().unwrap();
+        assert!(full.text.contains(&own), "{}", full.text);
+        assert!(full.trimmed.iter().any(|t| t == "checkpoint:shortened"), "{:?}", full.trimmed);
+        assert!(
+            full.text.len() > DEFAULT_BUDGET && full.text.len() <= DEFAULT_BUDGET + OWN_BYTES,
+            "{}",
+            full.text.len()
+        );
+
+        // More than its room holds: the end of it goes, the last request stays.
+        store.record_at(ev("prompt", "claude", "big", &dash), at(26)).unwrap();
+        store.record_at(ev("prompt", "claude", "big", &slide), at(24)).unwrap();
+        store.record_at(ev("prompt", "claude", "big", "rename the modules"), at(20)).unwrap();
+        let mut scratch = ev("write", "claude", "big", "Write a probe");
+        scratch.files = vec!["C:/Temp/claude/scratchpad/probe.py".into()];
+        store.record_at(scratch, at(19)).unwrap();
+        for i in 0..6 {
+            let mut rename = ev("edit", "claude", "big", "Edit a module");
+            rename.files = vec![format!("src/{}/module_{i}.rs", "deeply/nested".repeat(8))];
+            store.record_at(rename, at(19)).unwrap();
+        }
+        for i in 0..4 {
+            let line =
+                format!("Run: cargo build --release --target x86_64-pc-windows-msvc --features feature_number_{i}");
+            let mut run = ev("command", "claude", "big", &line);
+            run.ok = Some(true);
+            store.record_at(run, at(18 - i)).unwrap();
+        }
+        store.record_at(ev("turn_end", "claude", "big", &"Renamed and rebuilt. ".repeat(20)), at(14)).unwrap();
+        let t = build(&store, &BriefRequest { resumed: true, ..req(Some("big")) }).unwrap().unwrap().text;
+        assert!(
+            t.contains("  Last request: \"rename the modules\"") && t.contains("  Files changed: src/deeply"),
+            "{t}"
+        );
+        assert!(t.contains("  An earlier request (") && !t.contains("Commands, oldest first: cargo build"), "{t}");
+        assert!(!t.contains("probe.py"), "its scratch files are left out: {t}");
     }
 
     #[test]
@@ -1075,6 +1341,7 @@ mod tests {
                     tags: vec![],
                     importance: 3,
                     source: None,
+                    model: None,
                 })
                 .unwrap();
         }
