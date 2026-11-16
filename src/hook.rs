@@ -431,6 +431,13 @@ fn handle_journal(
                 if let Err(e) = store.record_at(save, env.now) {
                     log_failure(host.name(), &e.to_string());
                 }
+                // The call's reply names what it wrote. The MCP server could
+                // stamp that only for a session that had connected.
+                if let Some(model) = base.model.as_deref() {
+                    if let Err(e) = store.stamp_saved(&project, &payload["tool_response"], model) {
+                        log_failure(host.name(), &e.to_string());
+                    }
+                }
             }
             if let Some(t) = tool_event(host, payload, &roots, event_name == "PostToolUseFailure") {
                 let edited = matches!(t.kind, "edit" | "write" | "delete") && t.ok != Some(false);
@@ -1611,5 +1618,31 @@ mod tests {
         let claim = stop("s3", "Fixed: the parser no longer chokes on unicode.");
         assert!(reason(send(&store, Host::Claude, claim, 73)).starts_with("CSM claim check: "));
         assert!(reason(send(&store, Host::Claude, stop("s3", plain), 74)).starts_with("CSM save nudge: "));
+    }
+
+    #[test]
+    fn what_a_session_saves_through_csm_is_stamped_with_its_model() {
+        let store = Store::open_in_memory().unwrap();
+        let start = json!({ "hook_event_name": "SessionStart", "session_id": "s1", "cwd": DIR, "source": "startup",
+                            "model": "claude-opus-5-5" });
+        send(&store, Host::Claude, start, 10);
+        // The MCP server of a session that never connected records no model.
+        let handoff = crate::journal::Checkpoint {
+            project: project(),
+            host: "mcp".into(),
+            summary: "Parser tightened".into(),
+            ..Default::default()
+        };
+        let made = store.checkpoint(handoff).unwrap();
+        let checkpoint = || events(&store).into_iter().find(|e| e.kind == "checkpoint").unwrap();
+        assert_eq!(checkpoint().model, None);
+
+        let reply = format!("Checkpoint #{} recorded.", made.checkpoint_id);
+        let post = json!({ "hook_event_name": "PostToolUse", "session_id": "s1", "cwd": DIR,
+                           "tool_name": "mcp__csm__csm_checkpoint", "tool_use_id": "t1",
+                           "tool_input": { "summary": "Parser tightened" },
+                           "tool_response": [{ "type": "text", "text": reply }] });
+        send(&store, Host::Claude, post, 20);
+        assert_eq!(checkpoint().model.as_deref(), Some("claude-opus-5-5"), "the model the session was running as");
     }
 }

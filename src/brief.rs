@@ -736,6 +736,7 @@ pub(crate) fn is_host_text(summary: &str) -> bool {
         "task-notification",
         "system-reminder",
         "cross-session-message",
+        "agent-message",
         "command-name",
         "command-message",
         "command-args",
@@ -1537,6 +1538,7 @@ mod tests {
             is_host_text("<task-notification> <task-id>x</task-id>")
                 && is_host_text("<cross-session-message from=\"x\">")
         );
+        assert!(is_host_text("<agent-message from=\"a1\"> [Subagent hand-back] done"), "a subagent's report");
     }
 
     #[test]

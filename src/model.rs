@@ -5,7 +5,9 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
@@ -66,6 +68,66 @@ impl Store {
             .optional()?
             .flatten())
     }
+
+    /// Stamps what a csm tool call just wrote in `project` with the model
+    /// that made the call, going by the tool's reply. The MCP server knows
+    /// the model only of a session that connected, and the command line
+    /// knows none; the hook that sees the call knows it for every session.
+    /// A record that already has a model keeps it. Returns how many records
+    /// were stamped.
+    pub fn stamp_saved(&self, project: &str, reply: &Value, model: &str) -> Result<usize> {
+        let Some(model) = clean(model) else {
+            return Ok(0);
+        };
+        let reply = texts(reply);
+        let id = |made: &Regex| made.captures(&reply).and_then(|c| c[1].parse::<i64>().ok());
+        let mut stamped = 0;
+        if let Some(memory) = id(&SAVED_MEMORY) {
+            stamped += self.conn.execute(
+                "UPDATE memories SET model = ?1 WHERE id = ?2 AND project = ?3 AND (model IS NULL OR model = '')",
+                params![model, memory, project],
+            )?;
+        }
+        // A checkpoint that sets or closes a goal writes those rows at the
+        // same instant.
+        if let Some(checkpoint) = id(&SAVED_CHECKPOINT) {
+            stamped += self.conn.execute(
+                "UPDATE events SET model = ?1
+                 WHERE project = ?3 AND kind IN ('checkpoint', 'goal', 'goal_done') AND (model IS NULL OR model = '')
+                   AND ts = (SELECT ts FROM events WHERE id = ?2 AND project = ?3 AND kind = 'checkpoint')",
+                params![model, checkpoint, project],
+            )?;
+        }
+        if let Some(decision) = id(&SAVED_DECISION) {
+            stamped += self.conn.execute(
+                "UPDATE csm_decisions SET model = ?1 WHERE id = ?2 AND project = ?3 AND (model IS NULL OR model = '')",
+                params![model, decision, project],
+            )?;
+        }
+        Ok(stamped)
+    }
+}
+
+/// What csm's tools and command line say when they have written a record.
+/// "Already saved as #4" and "Already on the board as #4" wrote nothing.
+static SAVED_MEMORY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bSaved #(\d+)").unwrap());
+static SAVED_CHECKPOINT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bCheckpoint #(\d+) recorded").unwrap());
+static SAVED_DECISION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bRecorded standing decision #(\d+)").unwrap());
+
+/// Every piece of text in a tool's reply, whatever shape the host passes it
+/// in: the text itself, content blocks, or a shell's output fields.
+fn texts(reply: &Value) -> String {
+    fn collect(value: &Value, depth: usize, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => out.push(text.clone()),
+            Value::Array(items) if depth < 4 => items.iter().for_each(|item| collect(item, depth + 1, out)),
+            Value::Object(fields) if depth < 4 => fields.values().for_each(|field| collect(field, depth + 1, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    collect(reply, 0, &mut out);
+    out.join("\n")
 }
 
 /// A model name fit to record: one line within the size limit that is not a
@@ -243,5 +305,66 @@ mod tests {
         for table in STAMPED {
             store.conn.query_row(&format!("SELECT COUNT(model) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap();
         }
+    }
+
+    #[test]
+    fn what_a_tool_call_wrote_is_stamped_with_the_callers_model() {
+        use crate::journal::Checkpoint;
+        use crate::store::NewMemory;
+        const P: &str = "C:/work/app";
+        let store = Store::open_in_memory().unwrap();
+        let remember = |content: &str| {
+            let new = NewMemory {
+                project: P.into(),
+                kind: "lesson".into(),
+                content: content.into(),
+                tags: vec![],
+                importance: 3,
+                source: None,
+                model: None,
+            };
+            store.save(new).unwrap().memory.id
+        };
+        let stamped = |sql: &str| -> i64 { store.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+
+        // A memory, from an MCP reply's content blocks.
+        let lto = remember("Release builds need LTO");
+        let reply = json!([{ "type": "text", "text": format!("Saved #{lto} (lesson).") }]);
+        assert_eq!(store.stamp_saved(P, &reply, "claude-opus-5-5").unwrap(), 1);
+        assert_eq!(store.get(lto).unwrap().unwrap().model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(store.stamp_saved(P, &reply, "claude-fable-5-2").unwrap(), 0, "the model it has stays");
+        assert_eq!(store.get(lto).unwrap().unwrap().model.as_deref(), Some("claude-opus-5-5"));
+
+        // Nothing was written, or not here, or by no model worth naming.
+        let dup = remember("Tests need the network off");
+        let already = json!(format!("Already saved as #{dup}; nothing added."));
+        assert_eq!(store.stamp_saved(P, &already, "claude-opus-5-5").unwrap(), 0);
+        let saved = json!(format!("Saved #{dup} (lesson)."));
+        assert_eq!(store.stamp_saved("C:/work/other", &saved, "claude-opus-5-5").unwrap(), 0, "another project");
+        assert_eq!(store.stamp_saved(P, &saved, SYNTHETIC).unwrap(), 0, "a placeholder");
+        assert_eq!(store.get(dup).unwrap().unwrap().model, None);
+
+        // A checkpoint and the goal it set, from a shell's output.
+        let goal = Checkpoint {
+            project: P.into(),
+            host: "mcp".into(),
+            summary: "Hooks wired".into(),
+            goal: Some("Ship v1".into()),
+            ..Default::default()
+        };
+        let made = store.checkpoint(goal).unwrap();
+        let shell =
+            json!({ "stdout": format!("Checkpoint #{} recorded. Goal set.\n", made.checkpoint_id), "stderr": "" });
+        assert_eq!(store.stamp_saved(P, &shell, "gpt-5.2-codex").unwrap(), 2);
+        assert_eq!(
+            stamped("SELECT COUNT(*) FROM events WHERE model = 'gpt-5.2-codex' AND kind IN ('checkpoint', 'goal')"),
+            2
+        );
+
+        // A standing decision, from a reply wrapped in a result object.
+        let decided = store.decide(P, Some("Saves don't matter"), None, "mcp", 10).unwrap();
+        let reply = json!({ "content": [{ "type": "text", "text": decided.summary() }] });
+        assert_eq!(store.stamp_saved(P, &reply, "claude-opus-5-5").unwrap(), 1);
+        assert_eq!(stamped("SELECT COUNT(*) FROM csm_decisions WHERE model = 'claude-opus-5-5'"), 1);
     }
 }
